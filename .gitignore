@@ -1,0 +1,12 @@
+.env
+data/*.db
+data/*.db-shm
+data/*.db-wal
+.checkpoints/*.db
+.checkpoints/*.db-shm
+.checkpoints/*.db-wal
+__pycache__/
+*.py[cod]
+.chainlit/
+.venv/
+.claude/settings.json

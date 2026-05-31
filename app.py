@@ -1,0 +1,345 @@
+import logging
+from pathlib import Path
+from typing import Optional
+
+import chainlit as cl
+from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
+from chainlit.types import ThreadDict
+from dotenv import load_dotenv
+from starlette.datastructures import Headers
+
+load_dotenv()
+logging.basicConfig(level=logging.WARNING)
+
+from src.mcp_tools import build_mcp_config, load_ga_tools
+from src.tools import list_tables, describe_table, query_database
+from src.graph import build_graph, create_checkpointer
+
+SQLITE_TOOLS = [list_tables, describe_table, query_database]
+
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+
+_DB_URI = f"sqlite+aiosqlite:///{DATA_DIR}/chainlit.db"
+
+_CREATE_TABLES_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    "id" TEXT PRIMARY KEY,
+    "identifier" TEXT NOT NULL UNIQUE,
+    "createdAt" TEXT,
+    "metadata" TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS threads (
+    "id" TEXT PRIMARY KEY,
+    "createdAt" TEXT,
+    "name" TEXT,
+    "userId" TEXT,
+    "userIdentifier" TEXT,
+    "tags" TEXT,
+    "metadata" TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS steps (
+    "id" TEXT PRIMARY KEY,
+    "name" TEXT NOT NULL,
+    "type" TEXT NOT NULL,
+    "threadId" TEXT NOT NULL,
+    "parentId" TEXT,
+    "streaming" INTEGER,
+    "waitForAnswer" INTEGER,
+    "isError" INTEGER,
+    "metadata" TEXT,
+    "tags" TEXT,
+    "input" TEXT,
+    "output" TEXT,
+    "createdAt" TEXT,
+    "start" TEXT,
+    "end" TEXT,
+    "generation" TEXT,
+    "showInput" TEXT,
+    "language" TEXT,
+    "indent" INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS feedbacks (
+    "id" TEXT PRIMARY KEY,
+    "forId" TEXT NOT NULL,
+    "value" INTEGER NOT NULL,
+    "comment" TEXT
+);
+
+CREATE TABLE IF NOT EXISTS elements (
+    "id" TEXT PRIMARY KEY,
+    "threadId" TEXT,
+    "type" TEXT,
+    "chainlitKey" TEXT,
+    "url" TEXT,
+    "objectKey" TEXT,
+    "name" TEXT NOT NULL,
+    "props" TEXT,
+    "display" TEXT,
+    "size" TEXT,
+    "language" TEXT,
+    "page" INTEGER,
+    "autoPlay" INTEGER,
+    "playerConfig" TEXT,
+    "forId" TEXT,
+    "mime" TEXT
+);
+"""
+
+
+@cl.data_layer
+def get_data_layer():
+    return SQLAlchemyDataLayer(conninfo=_DB_URI)
+
+
+@cl.on_app_startup
+async def on_app_startup():
+    """Create Chainlit data layer tables if they don't exist yet."""
+    import aiosqlite
+    db_path = str(DATA_DIR / "chainlit.db")
+    repaired = 0
+    async with aiosqlite.connect(db_path) as conn:
+        for statement in _CREATE_TABLES_SQL.strip().split(";\n\n"):
+            stmt = statement.strip()
+            if stmt:
+                await conn.execute(stmt)
+        cursor = await conn.execute(
+            """
+            UPDATE steps
+            SET "parentId" = NULL
+            WHERE "parentId" IS NOT NULL
+              AND "parentId" NOT IN (SELECT "id" FROM steps)
+            """
+        )
+        repaired = max(cursor.rowcount, 0)
+        await conn.commit()
+    if repaired:
+        print(f"[startup] Repaired {repaired} orphan Chainlit step parent(s)")
+    print("[startup] Chainlit DB tables ready")
+
+
+@cl.header_auth_callback
+async def header_auth_callback(headers: Headers) -> Optional[cl.User]:
+    return cl.User(identifier="local", metadata={"role": "user"})
+
+
+async def _setup_session(thread_id: str) -> None:
+    """Build MCP tools, checkpointer, and graph; store in user session."""
+    mcp_config = build_mcp_config()
+    if mcp_config:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+        mcp_client = MultiServerMCPClient({"ga4": mcp_config})
+        await mcp_client.__aenter__()
+        ga_tools = await load_ga_tools(mcp_client)
+        cl.user_session.set("mcp_client", mcp_client)
+    else:
+        ga_tools = []
+        cl.user_session.set("mcp_client", None)
+
+    all_tools = SQLITE_TOOLS + ga_tools
+    checkpointer_cm = create_checkpointer()
+    checkpointer = await checkpointer_cm.__aenter__()
+    graph = build_graph(all_tools, checkpointer)
+    cl.user_session.set("graph", graph)
+    cl.user_session.set("checkpointer", checkpointer)
+    cl.user_session.set("checkpointer_cm", checkpointer_cm)
+    cl.user_session.set("thread_id", thread_id)
+
+
+async def _send_message(
+    content: str,
+    parent_id: Optional[str] = None,
+    **kwargs,
+) -> cl.Message:
+    """Send a Chainlit message with an explicit persisted parent."""
+    msg = cl.Message(content=content, **kwargs)
+    msg.parent_id = parent_id
+    await msg.send()
+    return msg
+
+
+@cl.on_chat_start
+async def on_chat_start():
+    # Chainlit assigns a UUID to the session; we reuse it as the LangGraph thread_id
+    # so both systems stay in sync without any extra metadata storage.
+    thread_id = cl.context.session.thread_id
+    await _setup_session(thread_id)
+
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: ThreadDict):
+    # thread["id"] is the Chainlit thread ID == our LangGraph thread_id.
+    # Rebuilding the graph with the same checkpointer restores full agent state.
+    thread_id = thread["id"]
+    await _setup_session(thread_id)
+    # Restore token/message baseline from the last persisted state so the
+    # cost badge and state inspector deltas are computed correctly.
+    ckpt = cl.user_session.get("checkpointer")
+    if ckpt:
+        graph = cl.user_session.get("graph")
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            state = await graph.aget_state(config)
+            if state and state.values:
+                v = state.values
+                cl.user_session.set("tokens_in", v.get("tokens_in", 0))
+                cl.user_session.set("tokens_out", v.get("tokens_out", 0))
+                cl.user_session.set("cost_eur", v.get("cost_eur", 0.0))
+                msgs = v.get("messages", [])
+                cl.user_session.set("msg_count", len(msgs))
+        except Exception:
+            pass
+
+
+def _format_state_inspector(
+    messages: list,
+    tokens_in: int,
+    tokens_out: int,
+    cost_eur: float,
+    d_in: int,
+    d_out: int,
+    d_cost: float,
+    msgs_before: int,
+) -> str:
+    lines = ["```", "AgentState", "══════════════════════════════════════════"]
+
+    n_new = len(messages) - msgs_before
+    lines.append(f"\nmessages  ({len(messages)} total, +{n_new} this turn):")
+    for i, msg in enumerate(messages):
+        msg_type = type(msg).__name__
+        content_preview = ""
+        suffix = ""
+
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            calls = [f"{tc['name']}()" for tc in msg.tool_calls]
+            suffix = f"  → calls: {', '.join(calls)}"
+        elif hasattr(msg, "content") and msg.content:
+            preview = str(msg.content).replace("\n", " ")[:60]
+            content_preview = f'  "{preview}{"…" if len(str(msg.content)) > 60 else ""}"'
+
+        marker = "▶" if i >= msgs_before else " "
+        lines.append(f"  {marker} [{i}] {msg_type:<18}{suffix}{content_preview}")
+
+    lines.append(f"\ntokens_in:   {tokens_in:>6,}  (+{d_in} this turn)")
+    lines.append(f"tokens_out:  {tokens_out:>6,}  (+{d_out} this turn)")
+    lines.append(f"cost_eur:  €{cost_eur:.6f}  (+€{d_cost:.6f} this turn)")
+    lines.append("```")
+    return "\n".join(lines)
+
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    try:
+        await _handle_message(message)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        await _send_message(content=f"⚠️ Error: {exc}", parent_id=message.id)
+
+
+async def _handle_message(message: cl.Message):
+    graph = cl.user_session.get("graph")
+    thread_id = cl.user_session.get("thread_id")
+
+    if graph is None:
+        await _send_message(
+            content="⚠️ Session not initialised — please refresh the page.",
+            parent_id=message.id,
+        )
+        return
+
+    config = {"configurable": {"thread_id": thread_id}}
+
+    tokens_in_before = cl.user_session.get("tokens_in", 0)
+    tokens_out_before = cl.user_session.get("tokens_out", 0)
+    cost_eur_before = cl.user_session.get("cost_eur", 0.0)
+    msgs_before = cl.user_session.get("msg_count", 0)
+
+    final_state: dict = {}
+    tool_steps: dict[str, cl.Step] = {}
+
+    async for event in graph.astream_events(
+        {"messages": [{"role": "user", "content": message.content}]},
+        config=config,
+        version="v2",
+    ):
+        kind = event["event"]
+
+        if kind == "on_tool_start":
+            tool_name = event["name"]
+            step = cl.Step(name=tool_name, type="tool")
+            await step.__aenter__()
+            tool_steps[event["run_id"]] = step
+
+        elif kind == "on_tool_end":
+            run_id = event["run_id"]
+            if run_id in tool_steps:
+                step = tool_steps.pop(run_id)
+                output = event["data"].get("output", "")
+                step.output = str(output)[:800]
+                await step.__aexit__(None, None, None)
+
+        elif kind == "on_chain_end" and event.get("name") == "LangGraph":
+            final_state = event["data"].get("output", {})
+
+    messages = final_state.get("messages", [])
+    tokens_in = final_state.get("tokens_in", 0)
+    tokens_out = final_state.get("tokens_out", 0)
+    cost_eur = final_state.get("cost_eur", 0.0)
+
+    cl.user_session.set("tokens_in", tokens_in)
+    cl.user_session.set("tokens_out", tokens_out)
+    cl.user_session.set("cost_eur", cost_eur)
+    cl.user_session.set("msg_count", len(messages))
+
+    final_content = ""
+    if messages:
+        last = messages[-1]
+        final_content = last.content if hasattr(last, "content") else str(last)
+
+    if final_content:
+        await _send_message(content=final_content, parent_id=message.id)
+
+    if messages:
+        try:
+            inspector_text = _format_state_inspector(
+                messages,
+                tokens_in, tokens_out, cost_eur,
+                d_in=tokens_in - tokens_in_before,
+                d_out=tokens_out - tokens_out_before,
+                d_cost=cost_eur - cost_eur_before,
+                msgs_before=msgs_before,
+            )
+            await _send_message(
+                content=f"**State Inspector**\n\n{inspector_text}",
+                parent_id=message.id,
+            )
+        except Exception as e:
+            print(f"[inspector error] {e}")
+
+    await _send_message(
+        content=f"💰 `€{cost_eur:.6f}` this session",
+        parent_id=message.id,
+        author="system",
+    )
+
+
+@cl.on_stop
+async def on_stop():
+    mcp_client = cl.user_session.get("mcp_client")
+    if mcp_client:
+        try:
+            await mcp_client.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    checkpointer_cm = cl.user_session.get("checkpointer_cm")
+    if checkpointer_cm:
+        try:
+            await checkpointer_cm.__aexit__(None, None, None)
+        except Exception:
+            pass
