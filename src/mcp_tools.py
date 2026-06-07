@@ -2,6 +2,7 @@ import logging
 import json
 import os
 import shlex
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -83,27 +84,17 @@ def build_mcp_config() -> dict[str, Any] | None:
         if not command:
             logger.warning("GA_MCP_COMMAND not set for stdio MCP - running SQLite-only")
             return None
+        if command.lower() in {"python", "python.exe"}:
+            command = sys.executable
 
-        env = {
-            key: value
-            for key in (
-                "GOOGLE_CLIENT_ID",
-                "GOOGLE_CLIENT_SECRET",
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                "GOOGLE_PROJECT_ID",
-                "GOOGLE_CLOUD_PROJECT",
-                "GA4_PROPERTY_ID",
-                "GA4_TOKEN_PATH",
-            )
-            if (value := os.getenv(key, "").strip())
-        }
+        env = dict(os.environ)
         config: dict[str, Any] = {
             "transport": "stdio",
             "command": command,
             "args": _split_args(os.getenv("GA_MCP_ARGS", "")),
+            "cwd": str(Path(__file__).parent.parent),
+            "env": env,
         }
-        if env:
-            config["env"] = env
         return config
 
     url = os.getenv("GA_MCP_URL", "").strip()

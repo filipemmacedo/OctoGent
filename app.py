@@ -7,11 +7,13 @@ import chainlit as cl
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from chainlit.types import ThreadDict
 from dotenv import load_dotenv
+from langgraph.errors import GraphRecursionError
 from starlette.datastructures import Headers
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
+from src.config import build_graph_config
 from src.mcp_tools import build_mcp_config, describe_mcp_config, load_ga_tools
 from src.tools import list_tables, describe_table, query_database
 from src.graph import build_graph, create_checkpointer
@@ -254,6 +256,13 @@ def _format_mcp_status(status: dict) -> str:
             lines.append("```")
             lines.extend(error_lines[:40])
             lines.append("```")
+        if "McpError: Connection closed" in "\n".join(error_lines):
+            lines.append("")
+            lines.append(
+                "The local stdio MCP process closed before tool discovery completed. "
+                "Restart Chainlit from the project root and verify the same GA4 MCP "
+                "config works with `python -m src.main`."
+            )
     else:
         lines.append("")
         lines.append(f"GA MCP loaded `{len(tool_names)}` tools.")
@@ -304,6 +313,9 @@ async def on_chat_resume(thread: ThreadDict):
                 cl.user_session.set("tokens_in", v.get("tokens_in", 0))
                 cl.user_session.set("tokens_out", v.get("tokens_out", 0))
                 cl.user_session.set("cost_eur", v.get("cost_eur", 0.0))
+                cl.user_session.set("halted", v.get("halted", False))
+                cl.user_session.set("budget_exceeded", v.get("budget_exceeded", False))
+                cl.user_session.set("halt_reason", v.get("halt_reason", ""))
                 msgs = v.get("messages", [])
                 cl.user_session.set("msg_count", len(msgs))
         except Exception:
@@ -315,6 +327,9 @@ def _format_state_inspector(
     tokens_in: int,
     tokens_out: int,
     cost_eur: float,
+    halted: bool,
+    budget_exceeded: bool,
+    halt_reason: str,
     d_in: int,
     d_out: int,
     d_cost: float,
@@ -341,6 +356,10 @@ def _format_state_inspector(
 
     lines.append(f"\ntokens_in:   {tokens_in:>6,}  (+{d_in} this turn)")
     lines.append(f"tokens_out:  {tokens_out:>6,}  (+{d_out} this turn)")
+    lines.append(f"halted:     {halted}")
+    lines.append(f"budget_exceeded: {budget_exceeded}")
+    if halt_reason:
+        lines.append(f"halt_reason: {halt_reason}")
     lines.append(f"cost_eur:  €{cost_eur:.6f}  (+€{d_cost:.6f} this turn)")
     lines.append("```")
     return "\n".join(lines)
@@ -367,7 +386,7 @@ async def _handle_message(message: cl.Message):
         )
         return
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = build_graph_config(thread_id)
 
     tokens_in_before = cl.user_session.get("tokens_in", 0)
     tokens_out_before = cl.user_session.get("tokens_out", 0)
@@ -377,38 +396,62 @@ async def _handle_message(message: cl.Message):
     final_state: dict = {}
     tool_steps: dict[str, cl.Step] = {}
 
-    async for event in graph.astream_events(
-        {"messages": [{"role": "user", "content": message.content}]},
-        config=config,
-        version="v2",
-    ):
-        kind = event["event"]
+    try:
+        async for event in graph.astream_events(
+            {"messages": [{"role": "user", "content": message.content}]},
+            config=config,
+            version="v2",
+        ):
+            kind = event["event"]
 
-        if kind == "on_tool_start":
-            tool_name = event["name"]
-            step = cl.Step(name=tool_name, type="tool")
-            await step.__aenter__()
-            tool_steps[event["run_id"]] = step
+            if kind == "on_tool_start":
+                tool_name = event["name"]
+                step = cl.Step(name=tool_name, type="tool")
+                await step.__aenter__()
+                tool_steps[event["run_id"]] = step
 
-        elif kind == "on_tool_end":
-            run_id = event["run_id"]
-            if run_id in tool_steps:
-                step = tool_steps.pop(run_id)
-                output = event["data"].get("output", "")
-                step.output = str(output)[:800]
-                await step.__aexit__(None, None, None)
+            elif kind == "on_tool_end":
+                run_id = event["run_id"]
+                if run_id in tool_steps:
+                    step = tool_steps.pop(run_id)
+                    output = event["data"].get("output", "")
+                    step.output = str(output)[:800]
+                    await step.__aexit__(None, None, None)
 
-        elif kind == "on_chain_end" and event.get("name") == "LangGraph":
-            final_state = event["data"].get("output", {})
+            elif kind == "on_chain_end" and event.get("name") == "LangGraph":
+                final_state = event["data"].get("output", {})
+    except GraphRecursionError as exc:
+        halt_reason = f"Loop limit exceeded: {exc}"
+        print(f"[recursion] halted: {halt_reason}")
+        for step in tool_steps.values():
+            await step.__aexit__(None, None, None)
+        tool_steps.clear()
+        try:
+            state = await graph.aget_state(config)
+            if state and state.values:
+                final_state = state.values
+        except Exception as state_exc:
+            print(f"[recursion] could not load checkpoint state: {state_exc}")
+        await _send_message(
+            content=f"Execution stopped: {halt_reason}",
+            parent_id=message.id,
+            author="system",
+        )
 
     messages = final_state.get("messages", [])
     tokens_in = final_state.get("tokens_in", 0)
     tokens_out = final_state.get("tokens_out", 0)
     cost_eur = final_state.get("cost_eur", 0.0)
+    halted = final_state.get("halted", False)
+    budget_exceeded = final_state.get("budget_exceeded", False)
+    halt_reason = final_state.get("halt_reason", "")
 
     cl.user_session.set("tokens_in", tokens_in)
     cl.user_session.set("tokens_out", tokens_out)
     cl.user_session.set("cost_eur", cost_eur)
+    cl.user_session.set("halted", halted)
+    cl.user_session.set("budget_exceeded", budget_exceeded)
+    cl.user_session.set("halt_reason", halt_reason)
     cl.user_session.set("msg_count", len(messages))
 
     final_content = ""
@@ -419,11 +462,19 @@ async def _handle_message(message: cl.Message):
     if final_content:
         await _send_message(content=final_content, parent_id=message.id)
 
+    if halted and halt_reason:
+        await _send_message(
+            content=f"Execution stopped: {halt_reason}",
+            parent_id=message.id,
+            author="system",
+        )
+
     if messages:
         try:
             inspector_text = _format_state_inspector(
                 messages,
                 tokens_in, tokens_out, cost_eur,
+                halted, budget_exceeded, halt_reason,
                 d_in=tokens_in - tokens_in_before,
                 d_out=tokens_out - tokens_out_before,
                 d_cost=cost_eur - cost_eur_before,

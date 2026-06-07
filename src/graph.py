@@ -1,5 +1,6 @@
 import os
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import RetryPolicy
 
+from src.config import get_agent_max_cost_eur
 from src.state import AgentState
 
 # EUR pricing for gpt-4o-mini (USD to EUR at 0.92)
@@ -18,6 +20,9 @@ PRICE_OUTPUT_PER_TOKEN = 0.60 / 1_000_000 * 0.92
 EUR_USD_RATE = 0.92
 
 CHECKPOINTS_PATH = Path(__file__).parent.parent / ".checkpoints" / "chat_history.db"
+ROUTE_CALL_MODEL = "call_model"
+ROUTE_TOOLS = "tools"
+ROUTE_END = "__end__"
 
 
 @asynccontextmanager
@@ -32,6 +37,7 @@ async def create_checkpointer():
 
 
 def _build_system_prompt() -> str:
+    today = date.today().isoformat()
     ga4_property_id = os.getenv("GA4_PROPERTY_ID", "").strip()
     property_hint = (
         "\n   A default GA4 property is configured in the MCP server environment. "
@@ -52,6 +58,10 @@ def _build_system_prompt() -> str:
 2. **Google Analytics 4 (GA4)** - session and event data via MCP tools (if available).
    Use GA4 tools to answer questions about traffic sources, sessions, events, and user behaviour.
 {property_hint}
+   GA4 date rules:
+   - Tool date arguments must be ISO dates (`YYYY-MM-DD`), `today`, `yesterday`, or relative values like `7daysAgo`.
+   - Today's date is {today}. If the user gives a clear colloquial date like "6th May", convert it to an ISO date before calling a tool.
+   - If the date is ambiguous or malformed, ask a short clarification question instead of sending an invalid date to a tool.
 
 Routing rules:
 - For e-commerce/business data questions about orders, products, customers, revenue, purchases, inventory, or database contents, use SQLite tools.
@@ -97,12 +107,64 @@ def build_graph(tools: list[Any], checkpointer=None):
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "cost_eur": cost_eur,
+            "halted": False,
+            "budget_exceeded": False,
+            "halt_reason": "",
         }
+
+    def budget_check(state: AgentState) -> dict:
+        budget_eur = get_agent_max_cost_eur()
+        cost_eur = state.get("cost_eur", 0.0)
+        if cost_eur < budget_eur:
+            return {
+                "halted": False,
+                "budget_exceeded": False,
+                "halt_reason": "",
+            }
+
+        reason = (
+            f"Budget exceeded: EUR {cost_eur:.6f} >= "
+            f"limit EUR {budget_eur:.6f}"
+        )
+        print(f"[budget] halted: {reason}")
+        return {
+            "halted": True,
+            "budget_exceeded": True,
+            "halt_reason": reason,
+        }
+
+    def route_after_budget_check(state: AgentState) -> str:
+        if state.get("budget_exceeded", False):
+            return ROUTE_END
+
+        messages = state.get("messages", [])
+        if not messages:
+            return ROUTE_CALL_MODEL
+
+        last_message = messages[-1]
+        if hasattr(last_message, "tool_calls"):
+            return tools_condition(state)
+
+        return ROUTE_CALL_MODEL
 
     graph = StateGraph(AgentState)
     graph.add_node("call_model", call_model)
-    graph.add_node("tools", ToolNode(tools), retry=RetryPolicy(max_attempts=3))
-    graph.add_edge(START, "call_model")
-    graph.add_conditional_edges("call_model", tools_condition)
-    graph.add_edge("tools", "call_model")
+    graph.add_node("budget_check", budget_check)
+    graph.add_node(
+        "tools",
+        ToolNode(tools, handle_tool_errors=True),
+        retry=RetryPolicy(max_attempts=3),
+    )
+    graph.add_edge(START, "budget_check")
+    graph.add_edge("call_model", "budget_check")
+    graph.add_edge("tools", "budget_check")
+    graph.add_conditional_edges(
+        "budget_check",
+        route_after_budget_check,
+        {
+            ROUTE_CALL_MODEL: "call_model",
+            ROUTE_TOOLS: "tools",
+            ROUTE_END: END,
+        },
+    )
     return graph.compile(checkpointer=checkpointer)
