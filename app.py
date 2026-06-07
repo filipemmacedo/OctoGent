@@ -1,6 +1,7 @@
 import logging
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import chainlit as cl
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
@@ -9,13 +10,15 @@ from dotenv import load_dotenv
 from starlette.datastructures import Headers
 
 load_dotenv()
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 
-from src.mcp_tools import build_mcp_config, load_ga_tools
+from src.mcp_tools import build_mcp_config, describe_mcp_config, load_ga_tools
 from src.tools import list_tables, describe_table, query_database
 from src.graph import build_graph, create_checkpointer
 
 SQLITE_TOOLS = [list_tables, describe_table, query_database]
+GA_TOOLS_CACHE: list[Any] = []
+MCP_STATUS_CACHE: dict[str, Any] | None = None
 
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -91,6 +94,24 @@ CREATE TABLE IF NOT EXISTS elements (
 """
 
 
+def _exception_tree_lines(exc: BaseException, indent: int = 0) -> list[str]:
+    prefix = "  " * indent
+    lines = [f"{prefix}{type(exc).__name__}: {exc}"]
+    if isinstance(exc, BaseExceptionGroup):
+        for index, sub_exc in enumerate(exc.exceptions, start=1):
+            lines.append(f"{prefix}sub-exception {index}:")
+            lines.extend(_exception_tree_lines(sub_exc, indent + 1))
+    cause = getattr(exc, "__cause__", None)
+    if cause:
+        lines.append(f"{prefix}caused by:")
+        lines.extend(_exception_tree_lines(cause, indent + 1))
+    context = getattr(exc, "__context__", None)
+    if context and context is not cause:
+        lines.append(f"{prefix}context:")
+        lines.extend(_exception_tree_lines(context, indent + 1))
+    return lines
+
+
 @cl.data_layer
 def get_data_layer():
     return SQLAlchemyDataLayer(conninfo=_DB_URI)
@@ -99,6 +120,8 @@ def get_data_layer():
 @cl.on_app_startup
 async def on_app_startup():
     """Create Chainlit data layer tables if they don't exist yet."""
+    global GA_TOOLS_CACHE, MCP_STATUS_CACHE
+
     import aiosqlite
     db_path = str(DATA_DIR / "chainlit.db")
     repaired = 0
@@ -121,6 +144,51 @@ async def on_app_startup():
         print(f"[startup] Repaired {repaired} orphan Chainlit step parent(s)")
     print("[startup] Chainlit DB tables ready")
 
+    MCP_STATUS_CACHE = await _load_mcp_tools_once()
+
+
+async def _load_mcp_tools_once() -> dict[str, Any]:
+    """Load GA MCP tools once per Chainlit process and cache the result."""
+    global GA_TOOLS_CACHE
+
+    mcp_config = build_mcp_config()
+    mcp_summary = describe_mcp_config(mcp_config)
+    status: dict[str, Any] = {
+        "summary": mcp_summary,
+        "tool_names": [],
+        "error": None,
+        "error_lines": [],
+    }
+    print("[mcp] config:")
+    print(json.dumps(mcp_summary, indent=2))
+
+    if not mcp_config:
+        GA_TOOLS_CACHE = []
+        print("[mcp] GA MCP not configured; using SQLite-only tools")
+        return status
+
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+    try:
+        mcp_client = MultiServerMCPClient({"ga4": mcp_config})
+        GA_TOOLS_CACHE = await load_ga_tools(mcp_client)
+        tool_names = [tool.name for tool in GA_TOOLS_CACHE]
+        status["tool_names"] = tool_names
+        print(f"[mcp] loaded GA tools: {tool_names}")
+    except Exception as exc:
+        import traceback
+
+        GA_TOOLS_CACHE = []
+        status["error"] = f"{type(exc).__name__}: {exc}"
+        status["error_lines"] = _exception_tree_lines(exc)
+        print(f"[mcp] failed to load GA tools: {exc!r}")
+        print("[mcp] exception tree:")
+        print("\n".join(status["error_lines"]))
+        traceback.print_exc()
+        print("[mcp] continuing with SQLite-only tools")
+
+    return status
+
 
 @cl.header_auth_callback
 async def header_auth_callback(headers: Headers) -> Optional[cl.User]:
@@ -129,18 +197,12 @@ async def header_auth_callback(headers: Headers) -> Optional[cl.User]:
 
 async def _setup_session(thread_id: str) -> None:
     """Build MCP tools, checkpointer, and graph; store in user session."""
-    mcp_config = build_mcp_config()
-    if mcp_config:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
-        mcp_client = MultiServerMCPClient({"ga4": mcp_config})
-        await mcp_client.__aenter__()
-        ga_tools = await load_ga_tools(mcp_client)
-        cl.user_session.set("mcp_client", mcp_client)
-    else:
-        ga_tools = []
-        cl.user_session.set("mcp_client", None)
+    global MCP_STATUS_CACHE
 
-    all_tools = SQLITE_TOOLS + ga_tools
+    if MCP_STATUS_CACHE is None:
+        MCP_STATUS_CACHE = await _load_mcp_tools_once()
+
+    all_tools = SQLITE_TOOLS + GA_TOOLS_CACHE
     checkpointer_cm = create_checkpointer()
     checkpointer = await checkpointer_cm.__aenter__()
     graph = build_graph(all_tools, checkpointer)
@@ -148,6 +210,57 @@ async def _setup_session(thread_id: str) -> None:
     cl.user_session.set("checkpointer", checkpointer)
     cl.user_session.set("checkpointer_cm", checkpointer_cm)
     cl.user_session.set("thread_id", thread_id)
+    cl.user_session.set("mcp_status", MCP_STATUS_CACHE)
+    return MCP_STATUS_CACHE
+
+
+def _format_mcp_status(status: dict) -> str:
+    summary = status.get("summary", {})
+    tool_names = status.get("tool_names", [])
+    error = status.get("error")
+    error_lines = status.get("error_lines", [])
+
+    lines = ["**MCP Status**"]
+    if not summary.get("configured"):
+        lines.append("GA MCP is not configured. Running SQLite-only.")
+        return "\n\n".join(lines)
+
+    lines.append(f"Transport: `{summary.get('transport')}`")
+    if summary.get("transport") == "stdio":
+        lines.append(f"Command: `{summary.get('command')}`")
+        lines.append(f"Args: `{' '.join(summary.get('args', []))}`")
+        lines.append(
+            f"OAuth client configured: `{summary.get('google_client_id_configured')}`"
+        )
+        lines.append(
+            f"GA4 default property configured: `{summary.get('ga4_property_id_configured')}`"
+        )
+        lines.append(
+            f"OAuth token path configured: `{summary.get('ga4_token_path_configured')}`"
+        )
+        credentials = summary.get("credentials", {})
+        lines.append(f"Legacy ADC credential exists: `{credentials.get('exists')}`")
+        lines.append(f"Legacy ADC credential type: `{credentials.get('type')}`")
+        if credentials.get("client_email"):
+            lines.append(f"Legacy service account: `{credentials['client_email']}`")
+
+    if error:
+        lines.append("")
+        lines.append("GA MCP failed to load. The session is running SQLite-only.")
+        lines.append(f"Error: `{error}`")
+        if error_lines:
+            lines.append("")
+            lines.append("Nested error:")
+            lines.append("```")
+            lines.extend(error_lines[:40])
+            lines.append("```")
+    else:
+        lines.append("")
+        lines.append(f"GA MCP loaded `{len(tool_names)}` tools.")
+        if tool_names:
+            lines.append(f"Tools: `{', '.join(tool_names)}`")
+
+    return "\n".join(lines)
 
 
 async def _send_message(
@@ -167,7 +280,8 @@ async def on_chat_start():
     # Chainlit assigns a UUID to the session; we reuse it as the LangGraph thread_id
     # so both systems stay in sync without any extra metadata storage.
     thread_id = cl.context.session.thread_id
-    await _setup_session(thread_id)
+    status = await _setup_session(thread_id)
+    await _send_message(content=_format_mcp_status(status), author="system")
 
 
 @cl.on_chat_resume
@@ -175,7 +289,8 @@ async def on_chat_resume(thread: ThreadDict):
     # thread["id"] is the Chainlit thread ID == our LangGraph thread_id.
     # Rebuilding the graph with the same checkpointer restores full agent state.
     thread_id = thread["id"]
-    await _setup_session(thread_id)
+    status = await _setup_session(thread_id)
+    await _send_message(content=_format_mcp_status(status), author="system")
     # Restore token/message baseline from the last persisted state so the
     # cost badge and state inspector deltas are computed correctly.
     ckpt = cl.user_session.get("checkpointer")
@@ -330,13 +445,6 @@ async def _handle_message(message: cl.Message):
 
 @cl.on_stop
 async def on_stop():
-    mcp_client = cl.user_session.get("mcp_client")
-    if mcp_client:
-        try:
-            await mcp_client.__aexit__(None, None, None)
-        except Exception:
-            pass
-
     checkpointer_cm = cl.user_session.get("checkpointer_cm")
     if checkpointer_cm:
         try:

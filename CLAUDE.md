@@ -1,6 +1,6 @@
 # CLAUDE.md — Governed Agent
 
-Project context for Claude Code. Read this fully before acting.
+Project context. Read this fully before acting.
 
 ## What this is
 
