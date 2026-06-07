@@ -1,11 +1,12 @@
 import asyncio
+import json
 import logging
 from dotenv import load_dotenv
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-from src.mcp_tools import build_mcp_config, load_ga_tools
+from src.mcp_tools import build_mcp_config, describe_mcp_config, load_ga_tools
 from src.tools import list_tables, describe_table, query_database
 from src.graph import build_graph, create_checkpointer
 
@@ -27,14 +28,22 @@ async def main() -> None:
     sqlite_tools = [list_tables, describe_table, query_database]
 
     mcp_config = build_mcp_config()
+    print("[mcp] config:")
+    print(json.dumps(describe_mcp_config(mcp_config), indent=2))
     if mcp_config:
         from langchain_mcp_adapters.client import MultiServerMCPClient
-        client = MultiServerMCPClient({"ga4": mcp_config})
-        await client.__aenter__()
-        ga_tools = await load_ga_tools(client)
+        try:
+            client = MultiServerMCPClient({"ga4": mcp_config})
+            ga_tools = await load_ga_tools(client)
+            print(f"[mcp] loaded GA tools: {[tool.name for tool in ga_tools]}")
+        except Exception as exc:
+            import traceback
+            print(f"[mcp] failed to load GA tools: {exc!r}")
+            traceback.print_exc()
+            raise
     else:
-        client = None
         ga_tools = []
+        print("[mcp] GA MCP not configured; using SQLite-only tools")
 
     try:
         async with create_checkpointer() as checkpointer:
@@ -58,9 +67,6 @@ async def main() -> None:
                 _print_state_debug(result)
     except (KeyboardInterrupt, EOFError):
         print("\nGoodbye.")
-    finally:
-        if client:
-            await client.__aexit__(None, None, None)
 
 
 if __name__ == "__main__":
