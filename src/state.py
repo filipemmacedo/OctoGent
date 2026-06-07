@@ -8,3 +8,6 @@ class AgentState(TypedDict):
     tokens_in: int
     tokens_out: int
     cost_eur: float
+    halted: bool
+    budget_exceeded: bool
+    halt_reason: str
