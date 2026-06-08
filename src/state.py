@@ -1,4 +1,5 @@
-from typing import Annotated
+import operator
+from typing import Annotated, Any
 from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages
 
@@ -11,3 +12,5 @@ class AgentState(TypedDict):
     halted: bool
     budget_exceeded: bool
     halt_reason: str
+    pending_approval: dict[str, Any] | None
+    hitl_decisions: Annotated[list[dict[str, Any]], operator.add]

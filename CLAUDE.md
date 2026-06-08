@@ -33,7 +33,7 @@ A tool-calling assistant over **two tools of deliberately different trust**:
 
 The agent sees one toolset; the governance layer treats the two differently.
 
-## Current status: Steps 1-2 complete, GA4 running
+## Current status: Steps 1-3 complete, GA4 running
 
 The current implementation is beyond the original skeleton:
 
@@ -44,27 +44,30 @@ The current implementation is beyond the original skeleton:
 - Chainlit UI exists in `app.py`, with a persisted SQLite data layer.
 - LangGraph state is persisted with `AsyncSqliteSaver` in `.checkpoints/`.
 - Token/cost ledger is implemented in `AgentState` and shown in logs/UI.
+- Circuit breaker controls are implemented: `AGENT_MAX_COST_EUR`,
+  `AGENT_RECURSION_LIMIT`, state-visible halt fields, and Chainlit/CLI halt
+  output.
 - The model prompt is trimmed to the last 3 messages before invocation; the
   persisted graph state and token ledger remain cumulative.
 
 Important files:
 
 ```
-app.py             # Chainlit UI, session persistence, MCP status, state inspector, cost badge
-src/state.py       # AgentState: messages + tokens_in + tokens_out + cost_eur
+app.py             # Chainlit UI, session persistence, MCP status, state inspector, cost/halt output
+src/state.py       # AgentState: messages + tokens_in + tokens_out + cost_eur + halt fields
 src/tools.py       # SQLite tools (list_tables, describe_table, query_database) + seed
 src/mcp_tools.py   # HTTP/stdio MCP config + GA4 tool loading
-src/graph.py       # build_graph(): call_model -> tools_condition -> tools -> loop
-src/main.py        # CLI entry point: python -m src.main
+src/config.py      # governance config: budget and recursion limit
+src/graph.py       # build_graph(): call_model -> budget_check -> tools/END -> loop
+src/main.py        # CLI entry point: python -m src.main, with recursion-limit handling
 ga4_mcp_server/    # Local OAuth GA4 MCP server
 requirements.txt   # LangGraph/LangChain/OpenAI/MCP/Chainlit deps
 .env.example       # OpenAI, GA4 MCP, local OAuth, Chainlit auth config
 ```
 
 The orchestration loop in `src/graph.py` is still the key seam:
-`START -> call_model --(tool calls?)--> tools -> call_model --(else)--> END`,
-using prebuilt `ToolNode` + `tools_condition`. Keep it clean; add controls
-around it rather than replacing the loop.
+`START -> call_model -> budget_check --(tool calls?)--> tools -> call_model`
+or `END`. Keep it clean; add controls around it rather than replacing the loop.
 
 ## Build roadmap (do strictly in order)
 
@@ -78,15 +81,27 @@ around it rather than replacing the loop.
   - Chainlit thread persistence is implemented.
   - LangGraph checkpoints restore full agent state across resumed threads.
   - Local OAuth GA4 MCP server is implemented and archived in OpenSpec.
-- **Step 3 - Circuit breaker.** Next.
+- **Step 3 - Circuit breaker.** Done.
   - Add budget config via `.env`, e.g. `AGENT_MAX_COST_EUR`.
   - Add a state-visible halt path if cumulative `cost_eur` exceeds the budget.
   - Set/standardize graph `recursion_limit` in invocation config.
   - Make halt decisions observable in logs/UI.
-- **Step 4 - Human-in-the-loop.**
+- **Step 4 - Human-in-the-loop.** Next.
   - Use modern `interrupt()` inside a node, resumed with `Command(resume=...)`.
   - Interrupt before executing any tool classified `sensitive`.
-  - Human can approve / edit args / reject; decision is written to state.
+  - Initial classification should treat GA4 MCP tools as `sensitive`; SQLite
+    discovery/query tools remain `safe` until honeypot hardening in Step 5.
+  - The human should be triggered by graph state, not by natural-language chat
+    parsing: when the latest AI message contains a sensitive tool call, a
+    pre-tool approval node calls `interrupt()` with the tool name, args, and
+    reason.
+  - Chainlit is the approval surface. Show structured controls (approve, edit
+    args, reject) using Chainlit actions/forms, then resume the same graph
+    thread with `Command(resume=...)`. Do not treat a normal chat reply like
+    "yes" as approval.
+  - CLI can use a blocking terminal prompt as a fallback approval surface.
+  - Human can approve / edit args / reject; decision is written to state as an
+    auditable HITL event.
   - Requires a checkpointer. On resume the node re-executes from the top, so any
     charged call or side effect before `interrupt()` must be idempotent.
 - **Step 5 - DB hardening + honeypot.**
@@ -121,6 +136,12 @@ around it rather than replacing the loop.
   know refresh tokens or call Google APIs directly.
 - HITL should use `interrupt()` + `Command(resume=...)`, not old
   `interrupt_before` / `interrupt_after`.
+- HITL approval should be implemented as a graph-level gate before `ToolNode`,
+  not inside individual tools. The gate classifies pending tool calls and only
+  interrupts for `sensitive` actions.
+- In Chainlit, human approval should be structured UI state (actions/forms)
+  linked to the pending interrupt. Regular chat messages remain user intent for
+  the agent, not governance approval.
 
 ## Conventions
 
@@ -152,4 +173,4 @@ never the other way around.
 
 Next OpenSpec change:
 
-`/opsx:propose "Step 3: halt the graph when EUR budget or recursion limits are exceeded"`
+`/opsx:propose "Step 4: require human approval before sensitive tool execution"`
