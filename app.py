@@ -8,6 +8,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 from chainlit.types import ThreadDict
 from dotenv import load_dotenv
 from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 from starlette.datastructures import Headers
 
 load_dotenv()
@@ -17,6 +18,7 @@ from src.config import build_graph_config
 from src.mcp_tools import build_mcp_config, describe_mcp_config, load_ga_tools
 from src.tools import list_tables, describe_table, query_database
 from src.graph import build_graph, create_checkpointer
+from src.tool_policy import build_tool_policies
 
 SQLITE_TOOLS = [list_tables, describe_table, query_database]
 GA_TOOLS_CACHE: list[Any] = []
@@ -205,9 +207,10 @@ async def _setup_session(thread_id: str) -> None:
         MCP_STATUS_CACHE = await _load_mcp_tools_once()
 
     all_tools = SQLITE_TOOLS + GA_TOOLS_CACHE
+    tool_policies = build_tool_policies(SQLITE_TOOLS, GA_TOOLS_CACHE)
     checkpointer_cm = create_checkpointer()
     checkpointer = await checkpointer_cm.__aenter__()
-    graph = build_graph(all_tools, checkpointer)
+    graph = build_graph(all_tools, checkpointer, tool_policies)
     cl.user_session.set("graph", graph)
     cl.user_session.set("checkpointer", checkpointer)
     cl.user_session.set("checkpointer_cm", checkpointer_cm)
@@ -316,6 +319,8 @@ async def on_chat_resume(thread: ThreadDict):
                 cl.user_session.set("halted", v.get("halted", False))
                 cl.user_session.set("budget_exceeded", v.get("budget_exceeded", False))
                 cl.user_session.set("halt_reason", v.get("halt_reason", ""))
+                cl.user_session.set("pending_approval", v.get("pending_approval"))
+                cl.user_session.set("hitl_decisions", v.get("hitl_decisions", []))
                 msgs = v.get("messages", [])
                 cl.user_session.set("msg_count", len(msgs))
         except Exception:
@@ -330,6 +335,8 @@ def _format_state_inspector(
     halted: bool,
     budget_exceeded: bool,
     halt_reason: str,
+    pending_approval: Optional[dict],
+    hitl_decisions: list[dict],
     d_in: int,
     d_out: int,
     d_cost: float,
@@ -360,9 +367,180 @@ def _format_state_inspector(
     lines.append(f"budget_exceeded: {budget_exceeded}")
     if halt_reason:
         lines.append(f"halt_reason: {halt_reason}")
+    lines.append(f"pending_approval: {bool(pending_approval)}")
+    lines.append(f"hitl_decisions: {len(hitl_decisions)}")
+    for decision in hitl_decisions[-3:]:
+        lines.append(
+            "  - "
+            f"{decision.get('decision')} "
+            f"{decision.get('tool_name')} "
+            f"({decision.get('classification')})"
+        )
     lines.append(f"cost_eur:  €{cost_eur:.6f}  (+€{d_cost:.6f} this turn)")
     lines.append("```")
     return "\n".join(lines)
+
+
+def _interrupt_payload_from_event(event: dict) -> Optional[dict]:
+    data = event.get("data") or {}
+    chunk = data.get("chunk") or {}
+    interrupts = chunk.get("__interrupt__") if isinstance(chunk, dict) else None
+    if not interrupts:
+        return None
+
+    interrupt_obj = interrupts[0]
+    payload = getattr(interrupt_obj, "value", interrupt_obj)
+    if isinstance(payload, dict) and payload.get("kind") == "tool_approval":
+        return payload
+    return None
+
+
+def _format_tool_approval_request(payload: dict) -> str:
+    lines = ["Human approval required before sensitive tool execution.", ""]
+    for index, tool_call in enumerate(payload.get("tool_calls", []), start=1):
+        lines.append(
+            f"{index}. `{tool_call.get('name')}` "
+            f"({tool_call.get('classification')})"
+        )
+        lines.append(f"Reason: {tool_call.get('reason')}")
+        lines.append("Args:")
+        lines.append("```json")
+        lines.append(json.dumps(tool_call.get("args", {}), indent=2))
+        lines.append("```")
+    return "\n".join(lines)
+
+
+def _action_name(response: Any) -> str:
+    if isinstance(response, dict):
+        return str(response.get("name") or "")
+    return str(getattr(response, "name", "") or "")
+
+
+def _message_content(response: Any) -> str:
+    if response is None:
+        return ""
+    if isinstance(response, dict):
+        return str(
+            response.get("output")
+            or response.get("content")
+            or response.get("message")
+            or ""
+        )
+    return str(getattr(response, "content", "") or "")
+
+
+async def _ask_for_json_args(payload: dict) -> Optional[dict]:
+    tool_calls = payload.get("tool_calls", [])
+    if len(tool_calls) == 1:
+        current = tool_calls[0].get("args", {})
+        prompt = (
+            "Edit the tool arguments as JSON. Submit a single JSON object.\n\n"
+            "Current arguments:\n"
+            "```json\n"
+            f"{json.dumps(current, indent=2)}\n"
+            "```"
+        )
+    else:
+        current = {
+            tool_call.get("id"): tool_call.get("args", {})
+            for tool_call in tool_calls
+        }
+        prompt = (
+            "Edit tool arguments as JSON keyed by tool call ID.\n\n"
+            "Current arguments:\n"
+            "```json\n"
+            f"{json.dumps(current, indent=2)}\n"
+            "```"
+        )
+
+    for _ in range(3):
+        response = await cl.AskUserMessage(
+            content=prompt,
+            timeout=300,
+            raise_on_timeout=False,
+        ).send()
+        raw = _message_content(response).strip()
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            await _send_message(
+                content=f"Invalid JSON: {exc}. Please try again.",
+                author="system",
+            )
+            continue
+        if isinstance(value, dict):
+            return value
+        await _send_message(
+            content="Edited arguments must be a JSON object. Please try again.",
+            author="system",
+        )
+    return None
+
+
+async def _ask_chainlit_approval(payload: dict) -> dict:
+    response = await cl.AskActionMessage(
+        content=_format_tool_approval_request(payload),
+        actions=[
+            cl.Action(
+                name="hitl_approve",
+                label="Approve",
+                payload={"decision": "approve"},
+            ),
+            cl.Action(
+                name="hitl_edit",
+                label="Edit args",
+                payload={"decision": "edit"},
+            ),
+            cl.Action(
+                name="hitl_reject",
+                label="Reject",
+                payload={"decision": "reject"},
+            ),
+        ],
+        timeout=300,
+        raise_on_timeout=False,
+    ).send()
+
+    action = _action_name(response)
+    if action == "hitl_approve":
+        return {"decision": "approve", "comment": "Approved in Chainlit"}
+
+    if action == "hitl_edit":
+        edited_args = await _ask_for_json_args(payload)
+        if edited_args is None:
+            return {
+                "decision": "reject",
+                "comment": "Edit cancelled or timed out in Chainlit",
+            }
+        return {
+            "decision": "edit",
+            "edited_args": edited_args,
+            "comment": "Edited in Chainlit",
+        }
+
+    if action == "hitl_reject":
+        reason = await cl.AskUserMessage(
+            content=(
+                "Rejection note (optional)\n\n"
+                "Add a short reason to send back to the agent, for example "
+                "`GA4 access not approved for this request`. Leave it blank "
+                "to use the default rejection message."
+            ),
+            timeout=120,
+            raise_on_timeout=False,
+        ).send()
+        comment = (
+            _message_content(reason).strip()
+            or "Sensitive tool call rejected by the human reviewer"
+        )
+        return {"decision": "reject", "comment": comment}
+
+    return {
+        "decision": "reject",
+        "comment": "Approval timed out or no action was selected in Chainlit",
+    }
 
 
 @cl.on_message
@@ -397,29 +575,45 @@ async def _handle_message(message: cl.Message):
     tool_steps: dict[str, cl.Step] = {}
 
     try:
-        async for event in graph.astream_events(
-            {"messages": [{"role": "user", "content": message.content}]},
-            config=config,
-            version="v2",
-        ):
-            kind = event["event"]
+        graph_input: Any = {
+            "messages": [{"role": "user", "content": message.content}]
+        }
+        while True:
+            interrupt_payload: Optional[dict] = None
+            async for event in graph.astream_events(
+                graph_input,
+                config=config,
+                version="v2",
+            ):
+                kind = event["event"]
 
-            if kind == "on_tool_start":
-                tool_name = event["name"]
-                step = cl.Step(name=tool_name, type="tool")
-                await step.__aenter__()
-                tool_steps[event["run_id"]] = step
+                if kind == "on_chain_stream":
+                    interrupt_payload = (
+                        _interrupt_payload_from_event(event) or interrupt_payload
+                    )
 
-            elif kind == "on_tool_end":
-                run_id = event["run_id"]
-                if run_id in tool_steps:
-                    step = tool_steps.pop(run_id)
-                    output = event["data"].get("output", "")
-                    step.output = str(output)[:800]
-                    await step.__aexit__(None, None, None)
+                elif kind == "on_tool_start":
+                    tool_name = event["name"]
+                    step = cl.Step(name=tool_name, type="tool")
+                    await step.__aenter__()
+                    tool_steps[event["run_id"]] = step
 
-            elif kind == "on_chain_end" and event.get("name") == "LangGraph":
-                final_state = event["data"].get("output", {})
+                elif kind == "on_tool_end":
+                    run_id = event["run_id"]
+                    if run_id in tool_steps:
+                        step = tool_steps.pop(run_id)
+                        output = event["data"].get("output", "")
+                        step.output = str(output)[:800]
+                        await step.__aexit__(None, None, None)
+
+                elif kind == "on_chain_end" and event.get("name") == "LangGraph":
+                    final_state = event["data"].get("output", {})
+
+            if not interrupt_payload:
+                break
+
+            decision = await _ask_chainlit_approval(interrupt_payload)
+            graph_input = Command(resume=decision)
     except GraphRecursionError as exc:
         halt_reason = f"Loop limit exceeded: {exc}"
         print(f"[recursion] halted: {halt_reason}")
@@ -445,6 +639,8 @@ async def _handle_message(message: cl.Message):
     halted = final_state.get("halted", False)
     budget_exceeded = final_state.get("budget_exceeded", False)
     halt_reason = final_state.get("halt_reason", "")
+    pending_approval = final_state.get("pending_approval")
+    hitl_decisions = final_state.get("hitl_decisions", [])
 
     cl.user_session.set("tokens_in", tokens_in)
     cl.user_session.set("tokens_out", tokens_out)
@@ -452,6 +648,8 @@ async def _handle_message(message: cl.Message):
     cl.user_session.set("halted", halted)
     cl.user_session.set("budget_exceeded", budget_exceeded)
     cl.user_session.set("halt_reason", halt_reason)
+    cl.user_session.set("pending_approval", pending_approval)
+    cl.user_session.set("hitl_decisions", hitl_decisions)
     cl.user_session.set("msg_count", len(messages))
 
     final_content = ""
@@ -475,6 +673,7 @@ async def _handle_message(message: cl.Message):
                 messages,
                 tokens_in, tokens_out, cost_eur,
                 halted, budget_exceeded, halt_reason,
+                pending_approval, hitl_decisions,
                 d_in=tokens_in - tokens_in_before,
                 d_out=tokens_out - tokens_out_before,
                 d_cost=cost_eur - cost_eur_before,

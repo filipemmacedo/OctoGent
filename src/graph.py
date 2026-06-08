@@ -1,18 +1,19 @@
 import os
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from langchain.chat_models import init_chat_model
 from langchain_core.callbacks import get_usage_metadata_callback
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.types import RetryPolicy
+from langgraph.types import RetryPolicy, interrupt
 
 from src.config import get_agent_max_cost_eur
 from src.state import AgentState
+from src.tool_policy import ToolPolicy, default_unknown_tool_policy
 
 # EUR pricing for gpt-4o-mini (USD to EUR at 0.92)
 PRICE_INPUT_PER_TOKEN = 0.15 / 1_000_000 * 0.92
@@ -21,6 +22,8 @@ EUR_USD_RATE = 0.92
 
 CHECKPOINTS_PATH = Path(__file__).parent.parent / ".checkpoints" / "chat_history.db"
 ROUTE_CALL_MODEL = "call_model"
+ROUTE_APPROVAL_GATE = "approval_gate"
+ROUTE_APPROVAL_INTERRUPT = "approval_interrupt"
 ROUTE_TOOLS = "tools"
 ROUTE_END = "__end__"
 
@@ -85,8 +88,149 @@ def _current_turn_messages(messages: list) -> list:
     return messages
 
 
-def build_graph(tools: list[Any], checkpointer=None):
+def _message_tool_calls(message: Any) -> list[dict[str, Any]]:
+    return list(getattr(message, "tool_calls", None) or [])
+
+
+def _get_tool_policy(
+    tool_policies: dict[str, ToolPolicy],
+    tool_name: str,
+) -> ToolPolicy:
+    return tool_policies.get(tool_name) or default_unknown_tool_policy(tool_name)
+
+
+def _build_approval_payload(
+    tool_calls: list[dict[str, Any]],
+    tool_policies: dict[str, ToolPolicy],
+) -> dict[str, Any] | None:
+    if not tool_calls:
+        return None
+
+    classified_calls: list[dict[str, Any]] = []
+    sensitive_ids: list[str] = []
+    for tool_call in tool_calls:
+        name = str(tool_call.get("name", ""))
+        policy = _get_tool_policy(tool_policies, name)
+        tool_call_id = str(tool_call.get("id", ""))
+        if policy["classification"] == "sensitive":
+            sensitive_ids.append(tool_call_id)
+        classified_calls.append(
+            {
+                "id": tool_call_id,
+                "name": name,
+                "args": tool_call.get("args", {}),
+                "source": policy["source"],
+                "classification": policy["classification"],
+                "reason": policy["reason"],
+            }
+        )
+
+    if not sensitive_ids:
+        return None
+
+    return {
+        "kind": "tool_approval",
+        "tool_calls": classified_calls,
+        "sensitive_tool_call_ids": sensitive_ids,
+    }
+
+
+def _decision_value(resume_value: Any) -> str:
+    if isinstance(resume_value, dict):
+        return str(resume_value.get("decision", "")).strip().lower()
+    return str(resume_value).strip().lower()
+
+
+def _decision_comment(resume_value: Any) -> str:
+    if not isinstance(resume_value, dict):
+        return ""
+    return str(
+        resume_value.get("reason")
+        or resume_value.get("comment")
+        or resume_value.get("message")
+        or ""
+    )
+
+
+def _edited_args_by_call_id(
+    payload: dict[str, Any],
+    resume_value: Any,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(resume_value, dict):
+        return {}
+
+    edited_args = resume_value.get("edited_args")
+    if edited_args is None:
+        edited_args = resume_value.get("args")
+    if not isinstance(edited_args, dict):
+        return {}
+
+    tool_calls = payload.get("tool_calls", [])
+    call_ids = {str(call.get("id", "")) for call in tool_calls}
+    if len(tool_calls) == 1:
+        only_id = str(tool_calls[0].get("id", ""))
+        if only_id not in edited_args:
+            return {only_id: edited_args}
+
+    return {
+        call_id: args
+        for call_id, args in edited_args.items()
+        if call_id in call_ids and isinstance(args, dict)
+    }
+
+
+def _copy_ai_message_with_tool_args(
+    message: Any,
+    final_args_by_id: dict[str, dict[str, Any]],
+) -> Any:
+    updated_tool_calls: list[dict[str, Any]] = []
+    for tool_call in _message_tool_calls(message):
+        updated_call = dict(tool_call)
+        call_id = str(updated_call.get("id", ""))
+        if call_id in final_args_by_id:
+            updated_call["args"] = final_args_by_id[call_id]
+        updated_tool_calls.append(updated_call)
+
+    if hasattr(message, "model_copy"):
+        return message.model_copy(update={"tool_calls": updated_tool_calls})
+    return message.copy(update={"tool_calls": updated_tool_calls})
+
+
+def _approval_decision_records(
+    payload: dict[str, Any],
+    decision: str,
+    comment: str,
+    final_args_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    records: list[dict[str, Any]] = []
+    for tool_call in payload.get("tool_calls", []):
+        call_id = str(tool_call.get("id", ""))
+        original_args = tool_call.get("args", {})
+        records.append(
+            {
+                "tool_call_id": call_id,
+                "tool_name": tool_call.get("name", ""),
+                "classification": tool_call.get("classification", ""),
+                "source": tool_call.get("source", ""),
+                "original_args": original_args,
+                "final_args": final_args_by_id.get(call_id, original_args),
+                "decision": decision,
+                "reason": tool_call.get("reason", ""),
+                "comment": comment,
+                "timestamp": timestamp,
+            }
+        )
+    return records
+
+
+def build_graph(
+    tools: list[Any],
+    checkpointer=None,
+    tool_policies: dict[str, ToolPolicy] | None = None,
+):
     """Build and compile the LangGraph ReAct agent. Returns the compiled graph."""
+    tool_policies = tool_policies or {}
     model = init_chat_model(
         os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         model_provider="openai",
@@ -151,13 +295,123 @@ def build_graph(tools: list[Any], checkpointer=None):
 
         last_message = messages[-1]
         if hasattr(last_message, "tool_calls"):
-            return tools_condition(state)
+            route = tools_condition(state)
+            if route == ROUTE_TOOLS:
+                return ROUTE_APPROVAL_GATE
+            return route
 
+        return ROUTE_CALL_MODEL
+
+    def approval_gate(state: AgentState) -> dict:
+        messages = state.get("messages", [])
+        if not messages:
+            return {"pending_approval": None}
+
+        tool_calls = _message_tool_calls(messages[-1])
+        payload = _build_approval_payload(tool_calls, tool_policies)
+        if payload is None:
+            if tool_calls:
+                print("[hitl] safe tool calls approved automatically")
+            return {"pending_approval": None}
+
+        names = ", ".join(call["name"] for call in payload["tool_calls"])
+        print(f"[hitl] approval required before tool execution: {names}")
+        return {"pending_approval": payload}
+
+    def route_after_approval_gate(state: AgentState) -> str:
+        if state.get("pending_approval"):
+            return ROUTE_APPROVAL_INTERRUPT
+
+        messages = state.get("messages", [])
+        if not messages:
+            return ROUTE_CALL_MODEL
+
+        last_message = messages[-1]
+        if hasattr(last_message, "tool_calls"):
+            return tools_condition(state)
+        return ROUTE_CALL_MODEL
+
+    def approval_interrupt(state: AgentState) -> dict:
+        payload = state.get("pending_approval")
+        if not payload:
+            return {"pending_approval": None}
+
+        resume_value = interrupt(payload)
+        decision = _decision_value(resume_value)
+        comment = _decision_comment(resume_value)
+
+        if decision not in {"approve", "edit", "reject"}:
+            decision = "reject"
+            comment = comment or "Invalid or missing approval decision"
+
+        messages = state.get("messages", [])
+        last_message = messages[-1] if messages else None
+        final_args_by_id: dict[str, dict[str, Any]] = {}
+
+        if decision == "edit":
+            final_args_by_id = _edited_args_by_call_id(payload, resume_value)
+            if last_message is not None and final_args_by_id:
+                updated_message = _copy_ai_message_with_tool_args(
+                    last_message,
+                    final_args_by_id,
+                )
+                records = _approval_decision_records(
+                    payload,
+                    decision,
+                    comment,
+                    final_args_by_id,
+                )
+                print("[hitl] sensitive tool call approved with edited args")
+                return {
+                    "messages": [updated_message],
+                    "pending_approval": None,
+                    "hitl_decisions": records,
+                }
+            decision = "reject"
+            comment = comment or "Edited arguments were missing or invalid"
+
+        if decision == "approve":
+            records = _approval_decision_records(payload, decision, comment, {})
+            print("[hitl] sensitive tool call approved")
+            return {
+                "pending_approval": None,
+                "hitl_decisions": records,
+            }
+
+        rejection_messages = [
+            ToolMessage(
+                content=(
+                    "Human rejected this sensitive tool call before execution."
+                    + (f" Reason: {comment}" if comment else "")
+                ),
+                tool_call_id=str(tool_call.get("id", "")),
+                name=str(tool_call.get("name", "")),
+            )
+            for tool_call in payload.get("tool_calls", [])
+        ]
+        records = _approval_decision_records(payload, "reject", comment, {})
+        print("[hitl] sensitive tool call rejected")
+        return {
+            "messages": rejection_messages,
+            "pending_approval": None,
+            "hitl_decisions": records,
+        }
+
+    def route_after_approval_interrupt(state: AgentState) -> str:
+        messages = state.get("messages", [])
+        if not messages:
+            return ROUTE_CALL_MODEL
+
+        last_message = messages[-1]
+        if hasattr(last_message, "tool_calls"):
+            return tools_condition(state)
         return ROUTE_CALL_MODEL
 
     graph = StateGraph(AgentState)
     graph.add_node("call_model", call_model)
     graph.add_node("budget_check", budget_check)
+    graph.add_node("approval_gate", approval_gate)
+    graph.add_node("approval_interrupt", approval_interrupt)
     graph.add_node(
         "tools",
         ToolNode(tools, handle_tool_errors=True),
@@ -169,6 +423,25 @@ def build_graph(tools: list[Any], checkpointer=None):
     graph.add_conditional_edges(
         "budget_check",
         route_after_budget_check,
+        {
+            ROUTE_CALL_MODEL: "call_model",
+            ROUTE_APPROVAL_GATE: "approval_gate",
+            ROUTE_END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "approval_gate",
+        route_after_approval_gate,
+        {
+            ROUTE_CALL_MODEL: "call_model",
+            ROUTE_APPROVAL_INTERRUPT: "approval_interrupt",
+            ROUTE_TOOLS: "tools",
+            ROUTE_END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "approval_interrupt",
+        route_after_approval_interrupt,
         {
             ROUTE_CALL_MODEL: "call_model",
             ROUTE_TOOLS: "tools",
