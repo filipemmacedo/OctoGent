@@ -2,6 +2,39 @@
 
 This project is a LangGraph + OpenAI reference implementation for governed tool-calling agents. It can use local SQLite tools and, when configured, a separate local Google Analytics 4 MCP server.
 
+It is designed as a showcase of enterprise-style agent governance: the agent is not just able to call tools, it also exposes how it reasons, how much it costs, when it should stop, and where sensitive integrations are isolated.
+
+## Showcase Highlights
+
+- **ReAct-style agent loop**: the graph follows the Reason + Act pattern through a model node, conditional tool routing, and a tool execution node.
+- **Governed state**: token usage, EUR cost, halt state, and halt reasons are stored in `AgentState`, making governance inspectable and persistent.
+- **Circuit breaker controls**: budget and recursion limits prevent runaway agent loops.
+- **Tool trust boundaries**: local SQLite tools and external GA4 MCP tools are presented as one toolset to the model, while the governance layer can treat them differently.
+- **LangSmith traceability**: LangSmith tracing can capture the graph execution, model calls, and tool calls for debugging and auditability.
+- **Human-ready UI**: Chainlit provides a chat interface, cost badge, state inspector, tool steps, and persisted sessions.
+
+## Architecture
+
+The core agent uses a ReAct-style loop implemented explicitly in LangGraph:
+
+```text
+START
+  -> call_model
+  -> budget_check
+      -> tools, when the model requests a tool
+      -> END, when the model can answer directly
+  -> call_model
+  -> ...
+```
+
+The important nodes are:
+
+- `call_model`: the reasoning step. The model receives the system prompt plus the active user turn and decides whether to answer or call a tool.
+- `budget_check`: the governance gate. It checks cumulative EUR cost after each model call and halts before another tool/model cycle if the budget is exceeded.
+- `tools`: the action step. LangGraph's `ToolNode` executes the requested SQLite or GA4 MCP tool.
+
+The graph keeps the current user turn and its complete tool-call transcript together, so the model does not forget which tools it already called while answering a question. This avoids repeated schema discovery loops such as repeatedly calling `list_tables`.
+
 The GA4 server is intentionally separated from the LangGraph agent:
 
 ```text
@@ -76,6 +109,34 @@ http://127.0.0.1:8080/
 ```
 
 If you create a Google OAuth **Desktop app** client, Google supports loopback redirects for local apps and this is the recommended setup. If you use a **Web application** OAuth client instead, add the exact redirect URI above under Authorized redirect URIs in Google Cloud Console, or set `GA4_OAUTH_HOST` / `GA4_OAUTH_PORT` to match the URI you registered.
+
+## LangSmith Tracing
+
+LangSmith is used for traceability. It lets you inspect a full agent run as a
+trace: graph execution, model calls, tool calls, timing, inputs, outputs, and
+errors. This is important for a governed-agent showcase because it provides the
+auditable "show your work" view alongside the state inspector in Chainlit.
+
+Configure it before starting Chainlit or the CLI:
+
+```dotenv
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=your-langsmith-api-key
+LANGSMITH_PROJECT=langgraph-governed-agent
+```
+
+If traces do not appear, first verify that the API key can access your
+LangSmith workspace. A `403 Forbidden` response from the LangSmith API means the
+key is being rejected. Common causes are using a key from a different workspace,
+using an organization-scoped key without `LANGSMITH_WORKSPACE_ID`, or using the
+wrong regional endpoint. For EU accounts, set:
+
+```dotenv
+LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+```
+
+Restart Chainlit after changing these values; `.env` is loaded when the Python
+process starts.
 
 ## Run the Local GA4 MCP Server
 

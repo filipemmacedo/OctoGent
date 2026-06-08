@@ -6,7 +6,7 @@ from typing import Any
 
 from langchain.chat_models import init_chat_model
 from langchain_core.callbacks import get_usage_metadata_callback
-from langchain_core.messages import SystemMessage, trim_messages
+from langchain_core.messages import SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import RetryPolicy
@@ -77,6 +77,14 @@ If GA4 tools are not available, say so clearly.
 """
 
 
+def _current_turn_messages(messages: list) -> list:
+    """Keep the active user turn and its complete tool-call transcript."""
+    for index in range(len(messages) - 1, -1, -1):
+        if getattr(messages[index], "type", None) == "human":
+            return messages[index:]
+    return messages
+
+
 def build_graph(tools: list[Any], checkpointer=None):
     """Build and compile the LangGraph ReAct agent. Returns the compiled graph."""
     model = init_chat_model(
@@ -85,8 +93,8 @@ def build_graph(tools: list[Any], checkpointer=None):
     ).bind_tools(tools)
 
     def call_model(state: AgentState) -> dict:
-        pruned = trim_messages(state["messages"], max_tokens=3, token_counter=len, strategy="last", start_on="human")
-        messages = [SystemMessage(content=_build_system_prompt())] + pruned
+        current_turn = _current_turn_messages(state["messages"])
+        messages = [SystemMessage(content=_build_system_prompt())] + current_turn
         with get_usage_metadata_callback() as cb:
             response = model.invoke(messages)
 
@@ -155,9 +163,9 @@ def build_graph(tools: list[Any], checkpointer=None):
         ToolNode(tools, handle_tool_errors=True),
         retry=RetryPolicy(max_attempts=3),
     )
-    graph.add_edge(START, "budget_check")
+    graph.add_edge(START, "call_model")
     graph.add_edge("call_model", "budget_check")
-    graph.add_edge("tools", "budget_check")
+    graph.add_edge("tools", "call_model")
     graph.add_conditional_edges(
         "budget_check",
         route_after_budget_check,

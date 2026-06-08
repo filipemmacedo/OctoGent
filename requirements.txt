@@ -14,3 +14,4 @@ google-auth>=2.29.0
 google-auth-oauthlib>=1.2.0
 google-analytics-admin>=0.24.0
 google-analytics-data>=0.18.0
+langsmith>=0.2.0
