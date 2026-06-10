@@ -1,7 +1,7 @@
 from typing import Any, Literal, TypedDict
 
 
-ToolClassification = Literal["safe", "sensitive"]
+ToolClassification = Literal["safe", "sensitive", "honeypot"]
 ToolSource = Literal["sqlite", "ga4", "unknown"]
 
 

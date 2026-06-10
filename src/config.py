@@ -1,5 +1,7 @@
 import os
 
+from src.observability import governance_run_metadata, governance_run_tags
+
 
 DEFAULT_AGENT_MAX_COST_EUR = 0.05
 DEFAULT_AGENT_RECURSION_LIMIT = 12
@@ -68,8 +70,27 @@ def get_agent_recursion_limit() -> int:
     return limit
 
 
-def build_graph_config(thread_id: str) -> dict:
+def build_graph_config(
+    thread_id: str,
+    interface: str = "unknown",
+    extra_metadata: dict | None = None,
+    extra_tags: list[str] | None = None,
+) -> dict:
+    recursion_limit = get_agent_recursion_limit()
+    metadata = {
+        **governance_run_metadata(thread_id, interface),
+        "recursion_limit": recursion_limit,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+
+    tags = governance_run_tags(interface)
+    if extra_tags:
+        tags.extend(extra_tags)
+
     return {
         "configurable": {"thread_id": thread_id},
-        "recursion_limit": get_agent_recursion_limit(),
+        "recursion_limit": recursion_limit,
+        "metadata": metadata,
+        "tags": tags,
     }

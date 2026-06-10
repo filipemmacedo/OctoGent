@@ -14,3 +14,4 @@ class AgentState(TypedDict):
     halt_reason: str
     pending_approval: dict[str, Any] | None
     hitl_decisions: Annotated[list[dict[str, Any]], operator.add]
+    honeypot_events: Annotated[list[dict[str, Any]], operator.add]

@@ -308,7 +308,7 @@ async def on_chat_resume(thread: ThreadDict):
     ckpt = cl.user_session.get("checkpointer")
     if ckpt:
         graph = cl.user_session.get("graph")
-        config = {"configurable": {"thread_id": thread_id}}
+        config = build_graph_config(thread_id, interface="chainlit")
         try:
             state = await graph.aget_state(config)
             if state and state.values:
@@ -321,6 +321,7 @@ async def on_chat_resume(thread: ThreadDict):
                 cl.user_session.set("halt_reason", v.get("halt_reason", ""))
                 cl.user_session.set("pending_approval", v.get("pending_approval"))
                 cl.user_session.set("hitl_decisions", v.get("hitl_decisions", []))
+                cl.user_session.set("honeypot_events", v.get("honeypot_events", []))
                 msgs = v.get("messages", [])
                 cl.user_session.set("msg_count", len(msgs))
         except Exception:
@@ -337,6 +338,7 @@ def _format_state_inspector(
     halt_reason: str,
     pending_approval: Optional[dict],
     hitl_decisions: list[dict],
+    honeypot_events: list[dict],
     d_in: int,
     d_out: int,
     d_cost: float,
@@ -375,6 +377,14 @@ def _format_state_inspector(
             f"{decision.get('decision')} "
             f"{decision.get('tool_name')} "
             f"({decision.get('classification')})"
+        )
+    lines.append(f"honeypot_events: {len(honeypot_events)}")
+    for event in honeypot_events[-3:]:
+        lines.append(
+            "  - "
+            f"{event.get('action')} "
+            f"{event.get('tool_name')} "
+            f"matched {event.get('matched_object')}"
         )
     lines.append(f"cost_eur:  €{cost_eur:.6f}  (+€{d_cost:.6f} this turn)")
     lines.append("```")
@@ -564,7 +574,7 @@ async def _handle_message(message: cl.Message):
         )
         return
 
-    config = build_graph_config(thread_id)
+    config = build_graph_config(thread_id, interface="chainlit")
 
     tokens_in_before = cl.user_session.get("tokens_in", 0)
     tokens_out_before = cl.user_session.get("tokens_out", 0)
@@ -641,6 +651,7 @@ async def _handle_message(message: cl.Message):
     halt_reason = final_state.get("halt_reason", "")
     pending_approval = final_state.get("pending_approval")
     hitl_decisions = final_state.get("hitl_decisions", [])
+    honeypot_events = final_state.get("honeypot_events", [])
 
     cl.user_session.set("tokens_in", tokens_in)
     cl.user_session.set("tokens_out", tokens_out)
@@ -650,6 +661,7 @@ async def _handle_message(message: cl.Message):
     cl.user_session.set("halt_reason", halt_reason)
     cl.user_session.set("pending_approval", pending_approval)
     cl.user_session.set("hitl_decisions", hitl_decisions)
+    cl.user_session.set("honeypot_events", honeypot_events)
     cl.user_session.set("msg_count", len(messages))
 
     final_content = ""
@@ -673,7 +685,7 @@ async def _handle_message(message: cl.Message):
                 messages,
                 tokens_in, tokens_out, cost_eur,
                 halted, budget_exceeded, halt_reason,
-                pending_approval, hitl_decisions,
+                pending_approval, hitl_decisions, honeypot_events,
                 d_in=tokens_in - tokens_in_before,
                 d_out=tokens_out - tokens_out_before,
                 d_cost=cost_eur - cost_eur_before,

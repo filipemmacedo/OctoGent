@@ -12,6 +12,12 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import RetryPolicy, interrupt
 
 from src.config import get_agent_max_cost_eur
+from src.honeypot import detect_honeypot_tool_call, honeypot_error_message
+from src.observability import (
+    emit_budget_halt,
+    emit_hitl_decision,
+    emit_honeypot_blocked,
+)
 from src.state import AgentState
 from src.tool_policy import ToolPolicy, default_unknown_tool_policy
 
@@ -22,6 +28,7 @@ EUR_USD_RATE = 0.92
 
 CHECKPOINTS_PATH = Path(__file__).parent.parent / ".checkpoints" / "chat_history.db"
 ROUTE_CALL_MODEL = "call_model"
+ROUTE_HONEYPOT_GUARD = "honeypot_guard"
 ROUTE_APPROVAL_GATE = "approval_gate"
 ROUTE_APPROVAL_INTERRUPT = "approval_interrupt"
 ROUTE_TOOLS = "tools"
@@ -133,6 +140,53 @@ def _build_approval_payload(
         "tool_calls": classified_calls,
         "sensitive_tool_call_ids": sensitive_ids,
     }
+
+
+def _honeypot_block_event(
+    tool_call: dict[str, Any],
+    policy: ToolPolicy,
+    matched_object: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "tool_call_id": str(tool_call.get("id", "")),
+        "tool_name": str(tool_call.get("name", "")),
+        "source": policy["source"],
+        "classification": "honeypot",
+        "matched_object": matched_object["name"],
+        "args": tool_call.get("args", {}),
+        "action": "blocked",
+        "reason": matched_object["reason"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _honeypot_rejection_messages(
+    tool_calls: list[dict[str, Any]],
+    honeypot_matches_by_id: dict[str, dict[str, str]],
+) -> list[ToolMessage]:
+    messages: list[ToolMessage] = []
+    matched_names = ", ".join(
+        sorted({match["name"] for match in honeypot_matches_by_id.values()})
+    )
+    for tool_call in tool_calls:
+        tool_call_id = str(tool_call.get("id", ""))
+        tool_name = str(tool_call.get("name", ""))
+        match = honeypot_matches_by_id.get(tool_call_id)
+        if match:
+            content = honeypot_error_message(match["name"], match["reason"])
+        else:
+            content = (
+                "Governance error: this tool-call batch was blocked because it "
+                f"also referenced SQLite honeypot object(s): {matched_names}."
+            )
+        messages.append(
+            ToolMessage(
+                content=content,
+                tool_call_id=tool_call_id,
+                name=tool_name,
+            )
+        )
+    return messages
 
 
 def _decision_value(resume_value: Any) -> str:
@@ -279,6 +333,18 @@ def build_graph(
             f"limit EUR {budget_eur:.6f}"
         )
         print(f"[budget] halted: {reason}")
+        emit_budget_halt(
+            {
+                "action": "halted",
+                "classification": "budget",
+                "source": "graph",
+                "cost_eur": cost_eur,
+                "budget_eur": budget_eur,
+                "halt_reason": reason,
+                "reason": reason,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         return {
             "halted": True,
             "budget_exceeded": True,
@@ -297,9 +363,65 @@ def build_graph(
         if hasattr(last_message, "tool_calls"):
             route = tools_condition(state)
             if route == ROUTE_TOOLS:
-                return ROUTE_APPROVAL_GATE
+                return ROUTE_HONEYPOT_GUARD
             return route
 
+        return ROUTE_CALL_MODEL
+
+    def honeypot_guard(state: AgentState) -> dict:
+        messages = state.get("messages", [])
+        if not messages:
+            return {}
+
+        tool_calls = _message_tool_calls(messages[-1])
+        if not tool_calls:
+            return {}
+
+        events: list[dict[str, Any]] = []
+        matches_by_id: dict[str, dict[str, str]] = {}
+        for tool_call in tool_calls:
+            name = str(tool_call.get("name", ""))
+            policy = _get_tool_policy(tool_policies, name)
+            if policy["source"] != "sqlite":
+                continue
+
+            match = detect_honeypot_tool_call(name, tool_call.get("args", {}))
+            if not match:
+                continue
+
+            tool_call_id = str(tool_call.get("id", ""))
+            matches_by_id[tool_call_id] = {
+                "name": match["name"],
+                "reason": match["reason"],
+            }
+            event = _honeypot_block_event(tool_call, policy, match)
+            events.append(event)
+            emit_honeypot_blocked(event)
+            print(
+                "[honeypot] blocked "
+                f"{name} matched {match['name']}: {match['reason']}"
+            )
+
+        if not events:
+            return {}
+
+        return {
+            "messages": _honeypot_rejection_messages(tool_calls, matches_by_id),
+            "honeypot_events": events,
+            "pending_approval": None,
+        }
+
+    def route_after_honeypot_guard(state: AgentState) -> str:
+        messages = state.get("messages", [])
+        if not messages:
+            return ROUTE_CALL_MODEL
+
+        last_message = messages[-1]
+        if hasattr(last_message, "tool_calls"):
+            route = tools_condition(state)
+            if route == ROUTE_TOOLS:
+                return ROUTE_APPROVAL_GATE
+            return route
         return ROUTE_CALL_MODEL
 
     def approval_gate(state: AgentState) -> dict:
@@ -361,6 +483,8 @@ def build_graph(
                     comment,
                     final_args_by_id,
                 )
+                for record in records:
+                    emit_hitl_decision(record)
                 print("[hitl] sensitive tool call approved with edited args")
                 return {
                     "messages": [updated_message],
@@ -372,6 +496,8 @@ def build_graph(
 
         if decision == "approve":
             records = _approval_decision_records(payload, decision, comment, {})
+            for record in records:
+                emit_hitl_decision(record)
             print("[hitl] sensitive tool call approved")
             return {
                 "pending_approval": None,
@@ -390,6 +516,8 @@ def build_graph(
             for tool_call in payload.get("tool_calls", [])
         ]
         records = _approval_decision_records(payload, "reject", comment, {})
+        for record in records:
+            emit_hitl_decision(record)
         print("[hitl] sensitive tool call rejected")
         return {
             "messages": rejection_messages,
@@ -410,6 +538,7 @@ def build_graph(
     graph = StateGraph(AgentState)
     graph.add_node("call_model", call_model)
     graph.add_node("budget_check", budget_check)
+    graph.add_node("honeypot_guard", honeypot_guard)
     graph.add_node("approval_gate", approval_gate)
     graph.add_node("approval_interrupt", approval_interrupt)
     graph.add_node(
@@ -425,7 +554,17 @@ def build_graph(
         route_after_budget_check,
         {
             ROUTE_CALL_MODEL: "call_model",
+            ROUTE_HONEYPOT_GUARD: "honeypot_guard",
+            ROUTE_END: END,
+        },
+    )
+    graph.add_conditional_edges(
+        "honeypot_guard",
+        route_after_honeypot_guard,
+        {
+            ROUTE_CALL_MODEL: "call_model",
             ROUTE_APPROVAL_GATE: "approval_gate",
+            ROUTE_TOOLS: "tools",
             ROUTE_END: END,
         },
     )

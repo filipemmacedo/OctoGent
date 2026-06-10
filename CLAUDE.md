@@ -26,14 +26,15 @@ so the system can *show* what it is doing and why. Auditability is the product.
 A tool-calling assistant over **two tools of deliberately different trust**:
 
 - **SQLite** (`src/tools.py`) - local, owned schema, low cost, deterministic.
-  This is the honeypot's future home. Exposed as native LangChain `@tool`s.
+  Includes the honeypot canary table and defensive access checks. Exposed as
+  native LangChain `@tool`s.
 - **Google Analytics 4** (`src/mcp_tools.py`, `ga4_mcp_server/`) - loaded through
   `langchain-mcp-adapters`. External, real cost, sensitive analytics data. This
   is where budget + HITL controls matter most.
 
 The agent sees one toolset; the governance layer treats the two differently.
 
-## Current status: Steps 1-3 complete, GA4 running
+## Current status: Steps 1-6 implemented
 
 The current implementation is beyond the original skeleton:
 
@@ -47,18 +48,31 @@ The current implementation is beyond the original skeleton:
 - Circuit breaker controls are implemented: `AGENT_MAX_COST_EUR`,
   `AGENT_RECURSION_LIMIT`, state-visible halt fields, and Chainlit/CLI halt
   output.
+- HITL controls are implemented with `interrupt()` / `Command(resume=...)`:
+  sensitive GA4 tools require structured approve/edit/reject decisions before
+  `ToolNode` execution.
+- SQLite honeypot controls are implemented: `api_keys_backup` is seeded with
+  fake credential-looking rows, hidden from normal discovery, defensively
+  rejected in SQLite tools, blocked at graph level before HITL/tool execution,
+  and recorded in `AgentState.honeypot_events`.
 - The model prompt is trimmed to the last 3 messages before invocation; the
   persisted graph state and token ledger remain cumulative.
+- Step 6 LangSmith observability is implemented for governance events.
+  LangSmith traces may show graph nodes like `honeypot_guard`; that only means
+  the guard ran. A real canary incident is indicated by `honeypot_events` and
+  explicit `governance_event=honeypot_blocked` trace metadata/tags.
 
 Important files:
 
 ```
 app.py             # Chainlit UI, session persistence, MCP status, state inspector, cost/halt output
-src/state.py       # AgentState: messages + tokens_in + tokens_out + cost_eur + halt fields
-src/tools.py       # SQLite tools (list_tables, describe_table, query_database) + seed
+src/state.py       # AgentState: messages + tokens/cost + halt + HITL + honeypot event fields
+src/tools.py       # SQLite tools (list_tables, describe_table, query_database) + seed + defensive honeypot checks
+src/honeypot.py    # SQLite honeypot registry, identifier detection, and governance error helpers
 src/mcp_tools.py   # HTTP/stdio MCP config + GA4 tool loading
 src/config.py      # governance config: budget and recursion limit
-src/graph.py       # build_graph(): call_model -> budget_check -> tools/END -> loop
+src/graph.py       # build_graph(): call_model -> budget_check -> honeypot_guard -> approval_gate/tools/END
+src/observability.py # LangSmith governance event emitters, trace metadata, and sanitization
 src/main.py        # CLI entry point: python -m src.main, with recursion-limit handling
 ga4_mcp_server/    # Local OAuth GA4 MCP server
 requirements.txt   # LangGraph/LangChain/OpenAI/MCP/Chainlit deps
@@ -66,8 +80,9 @@ requirements.txt   # LangGraph/LangChain/OpenAI/MCP/Chainlit deps
 ```
 
 The orchestration loop in `src/graph.py` is still the key seam:
-`START -> call_model -> budget_check --(tool calls?)--> tools -> call_model`
-or `END`. Keep it clean; add controls around it rather than replacing the loop.
+`START -> call_model -> budget_check --(tool calls?)--> honeypot_guard ->
+approval_gate -> tools -> call_model` or `END`. Keep it clean; add controls
+around it rather than replacing the loop.
 
 ## Build roadmap (do strictly in order)
 
@@ -86,11 +101,11 @@ or `END`. Keep it clean; add controls around it rather than replacing the loop.
   - Add a state-visible halt path if cumulative `cost_eur` exceeds the budget.
   - Set/standardize graph `recursion_limit` in invocation config.
   - Make halt decisions observable in logs/UI.
-- **Step 4 - Human-in-the-loop.** Next.
+- **Step 4 - Human-in-the-loop.** Done.
   - Use modern `interrupt()` inside a node, resumed with `Command(resume=...)`.
   - Interrupt before executing any tool classified `sensitive`.
-  - Initial classification should treat GA4 MCP tools as `sensitive`; SQLite
-    discovery/query tools remain `safe` until honeypot hardening in Step 5.
+  - GA4 MCP tools are classified as `sensitive`; SQLite discovery/query tools
+    are statically `safe`, with dynamic honeypot blocking added in Step 5.
   - The human should be triggered by graph state, not by natural-language chat
     parsing: when the latest AI message contains a sensitive tool call, a
     pre-tool approval node calls `interrupt()` with the tool name, args, and
@@ -104,18 +119,24 @@ or `END`. Keep it clean; add controls around it rather than replacing the loop.
     auditable HITL event.
   - Requires a checkpointer. On resume the node re-executes from the top, so any
     charged call or side effect before `interrupt()` must be idempotent.
-- **Step 5 - DB hardening + honeypot.**
+- **Step 5 - DB hardening + honeypot.** Implemented; archive when reviewed.
   - Keep DB access scoped/read-only.
-  - Plant a canary table in SQLite, e.g. `api_keys_backup`, that no legitimate
-    query should touch.
+  - Canary table `api_keys_backup` exists in SQLite with fake rows only; no
+    legitimate query should touch it.
   - Pre-execution inspect every query/tool call; any reference to honeypot
-    objects is blocked, logged, and alerted.
+    objects is blocked, logged, and recorded.
   - Introduce state-visible tool classification: `safe`, `sensitive`,
     `honeypot`.
-- **Step 6 - Persistence + observability.**
+- **Step 6 - Persistence + observability.** Implemented; archive when reviewed.
   - Consider swapping SQLite checkpointer for Postgres when resume-days-later or
     multi-user durability is needed.
-  - Add tracing (LangSmith or Langfuse) as the auditable "show I control" view.
+  - Add LangSmith observability as the auditable "show I control" view for
+    governance events.
+  - Keep `AgentState` as the source of truth; LangSmith is the searchable trace
+    and investigation surface.
+  - Emit explicit events such as `honeypot_blocked`, `hitl_decision`, and
+    `budget_halt` so seeing a guard node in LangSmith is not confused with a
+    real incident.
 
 ## Key technical facts
 
@@ -139,6 +160,13 @@ or `END`. Keep it clean; add controls around it rather than replacing the loop.
 - HITL approval should be implemented as a graph-level gate before `ToolNode`,
   not inside individual tools. The gate classifies pending tool calls and only
   interrupts for `sensitive` actions.
+- Honeypot blocking should run before HITL approval. Honeypot calls are
+  deny-only and should never be presented for human approval.
+- `src/honeypot.py` owns the SQLite canary registry and exact/quoted identifier
+  detection for `api_keys_backup`.
+- LangSmith automatic traces may show every graph node. Treat explicit
+  `honeypot_events` / `governance_event=honeypot_blocked` metadata as the
+  signal of an actual canary access attempt.
 - In Chainlit, human approval should be structured UI state (actions/forms)
   linked to the pending interrupt. Regular chat messages remain user intent for
   the agent, not governance approval.
@@ -154,6 +182,8 @@ or `END`. Keep it clean; add controls around it rather than replacing the loop.
 - SQLite tools follow discovery-before-query: list -> describe -> query.
 - Keep governance visible: every budget, honeypot, HITL, or routing decision
   should print/log what happened and why.
+- Observability must be optional and non-blocking: LangSmith tracing should
+  never become required for local development or policy enforcement.
 
 ## Workflow: OpenSpec (spec-driven development)
 
@@ -173,4 +203,4 @@ never the other way around.
 
 Next OpenSpec change:
 
-`/opsx:propose "Step 4: require human approval before sensitive tool execution"`
+`/opsx:archive add-langsmith-governance-observability`
