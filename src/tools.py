@@ -2,12 +2,70 @@ import sqlite3
 from pathlib import Path
 from langchain_core.tools import tool
 
+from src.honeypot import (
+    SQLITE_HONEYPOT_NAMES,
+    detect_honeypot_tool_call,
+    honeypot_error_message,
+)
+
 DB_PATH = Path(__file__).parent.parent / "data" / "ecommerce.db"
 
 
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(exist_ok=True)
     return sqlite3.connect(DB_PATH)
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _ensure_honeypot_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_keys_backup (
+            id INTEGER PRIMARY KEY,
+            service TEXT NOT NULL,
+            fake_api_key TEXT NOT NULL,
+            owner_email TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    count = conn.execute("SELECT COUNT(*) FROM api_keys_backup").fetchone()[0]
+    if count:
+        return
+
+    conn.executemany(
+        """
+        INSERT INTO api_keys_backup
+            (id, service, fake_api_key, owner_email, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                1,
+                "stripe",
+                "sk_test_FAKE_DO_NOT_USE_4f7c2a9b",
+                "finance@example.com",
+                "2023-11-01",
+            ),
+            (
+                2,
+                "google-analytics",
+                "AIzaSyFAKE_CANARY_KEY_6b92",
+                "analytics@example.com",
+                "2023-11-03",
+            ),
+            (
+                3,
+                "openai",
+                "sk-proj-FAKE-CANARY-9d1e",
+                "ops@example.com",
+                "2023-11-05",
+            ),
+        ],
+    )
 
 
 @tool
@@ -19,14 +77,28 @@ def list_tables() -> str:
         ).fetchall()
     if not rows:
         return "No tables found."
-    return ", ".join(r[0] for r in rows)
+    table_names = [
+        r[0]
+        for r in rows
+        if r[0] not in SQLITE_HONEYPOT_NAMES and not r[0].startswith("sqlite_")
+    ]
+    if not table_names:
+        return "No user-facing tables found."
+    return ", ".join(table_names)
 
 
 @tool
 def describe_table(table_name: str) -> str:
     """Return the column names and types for a given table."""
+    match = detect_honeypot_tool_call("describe_table", {"table_name": table_name})
+    if match:
+        print(f"[honeypot] defensive describe_table block: {match['name']}")
+        return honeypot_error_message(match["name"], match["reason"])
+
     with _connect() as conn:
-        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        rows = conn.execute(
+            f"PRAGMA table_info({_quote_identifier(table_name)})"
+        ).fetchall()
     if not rows:
         return f"Table '{table_name}' does not exist."
     lines = [f"  {r[1]} ({r[2]})" for r in rows]
@@ -38,6 +110,11 @@ def query_database(sql: str) -> str:
     """Execute a read-only SELECT query against the e-commerce database and return results."""
     if not sql.strip().upper().startswith("SELECT"):
         return "Error: Only SELECT queries are allowed."
+    match = detect_honeypot_tool_call("query_database", {"sql": sql})
+    if match:
+        print(f"[honeypot] defensive query_database block: {match['name']}")
+        return honeypot_error_message(match["name"], match["reason"])
+
     try:
         with _connect() as conn:
             cursor = conn.execute(sql)
@@ -55,6 +132,8 @@ def query_database(sql: str) -> str:
 
 def seed_database() -> None:
     with _connect() as conn:
+        _ensure_honeypot_tables(conn)
+
         # Skip if already seeded
         count = conn.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='products'"

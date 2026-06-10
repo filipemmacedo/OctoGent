@@ -28,6 +28,7 @@ def _print_state_debug(state: dict) -> None:
             "halt_reason": state.get("halt_reason", ""),
             "pending_approval": bool(state.get("pending_approval")),
             "hitl_decisions": len(state.get("hitl_decisions", [])),
+            "honeypot_events": len(state.get("honeypot_events", [])),
             "messages": len(messages),
         }
     )
@@ -121,7 +122,7 @@ async def main() -> None:
 
             print("\nAgent ready. Type your question (Ctrl+C to quit).\n")
             thread_id = "cli-session"
-            config = build_graph_config(thread_id)
+            config = build_graph_config(thread_id, interface="cli")
 
             while True:
                 user_input = input("You: ").strip()

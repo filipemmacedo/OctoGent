@@ -112,8 +112,8 @@ If you create a Google OAuth **Desktop app** client, Google supports loopback re
 
 ## LangSmith Tracing
 
-LangSmith is used for traceability. It lets you inspect a full agent run as a
-trace: graph execution, model calls, tool calls, timing, inputs, outputs, and
+LangSmith can be used for traceability. It lets you inspect a full agent run as
+a trace: graph execution, model calls, tool calls, timing, inputs, outputs, and
 errors. This is important for a governed-agent showcase because it provides the
 auditable "show your work" view alongside the state inspector in Chainlit.
 
@@ -124,6 +124,25 @@ LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=your-langsmith-api-key
 LANGSMITH_PROJECT=langgraph-governed-agent
 ```
+
+Governance events are mirrored into LangSmith as explicit trace spans and
+metadata while `AgentState` remains the source of truth. Useful filters:
+
+```text
+tag:honeypot
+tag:blocked
+metadata.governance_event = honeypot_blocked
+metadata.governance_event = hitl_decision
+metadata.governance_event = budget_halt
+metadata.thread_id = <chainlit-or-cli-thread-id>
+metadata.interface = chainlit
+metadata.interface = cli
+```
+
+Seeing a graph node named `honeypot_guard` in LangSmith is normal; that only
+means the guard ran. A real canary incident is indicated by
+`AgentState.honeypot_events` and the explicit LangSmith metadata
+`governance_event=honeypot_blocked`.
 
 If traces do not appear, first verify that the API key can access your
 LangSmith workspace. A `403 Forbidden` response from the LangSmith API means the

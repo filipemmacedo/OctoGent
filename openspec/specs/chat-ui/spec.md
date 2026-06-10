@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define the Chainlit chat interface, session visibility, state inspector behavior, and trace correlation requirements.
+
+## Requirements
 
 ### Requirement: Chat window displays conversation with tool step visibility
 The system SHALL render an async Chainlit chat interface where each user message triggers the agent and the response is streamed back. Tool call steps (tool name, duration) SHALL be visible as collapsible child steps on the assistant message.
@@ -35,11 +39,11 @@ The system SHALL display the running session cost in EUR in the chat interface a
 
 #### Scenario: Cost badge shown after response
 - **WHEN** the assistant finishes a response
-- **THEN** a cost indicator (e.g., "💰 €0.0012 this session") is visible near the response
+- **THEN** a cost indicator is visible near the response
 
 #### Scenario: Cost starts at zero for new sessions
 - **WHEN** a new session is started
-- **THEN** the cost display shows €0.000000
+- **THEN** the cost display shows EUR 0.000000
 
 ---
 
@@ -53,3 +57,42 @@ The system SHALL be launchable with the standard Chainlit command from the proje
 #### Scenario: App starts in SQLite-only mode when GA_MCP_URL absent
 - **WHEN** `GA_MCP_URL` is not set in `.env`
 - **THEN** the app starts successfully and a warning is logged; SQLite tools are available
+
+---
+
+### Requirement: State inspector displays honeypot governance events
+The Chainlit state inspector SHALL display whether honeypot events have occurred and SHALL summarize recent honeypot blocks using the tool name, matched object, and action.
+
+#### Scenario: Honeypot count shown after block
+- **WHEN** Chainlit renders the state inspector after a honeypot access attempt is blocked
+- **THEN** the inspector shows a non-zero honeypot event count
+
+#### Scenario: Recent honeypot event is summarized
+- **WHEN** Chainlit renders the state inspector after one or more honeypot access attempts are blocked
+- **THEN** the inspector includes the most recent honeypot event summary with the matched object `api_keys_backup`
+
+---
+
+### Requirement: Chainlit traces can be correlated with chat sessions
+The Chainlit UI SHALL pass trace metadata that allows a LangSmith trace to be correlated with the Chainlit thread that produced it.
+
+#### Scenario: Chainlit thread ID appears in trace metadata
+- **WHEN** Chainlit streams a graph run for a user message
+- **THEN** the run metadata includes the Chainlit thread ID used as the LangGraph `thread_id`
+
+#### Scenario: Resumed session keeps same trace correlation key
+- **WHEN** a user resumes a Chainlit thread and sends another message
+- **THEN** the graph run metadata uses the same thread ID as the resumed checkpoint state
+
+---
+
+### Requirement: Chainlit state inspector remains the local governance view
+The Chainlit state inspector SHALL continue to display local governance state even when LangSmith observability is enabled.
+
+#### Scenario: Honeypot state remains visible in Chainlit
+- **WHEN** a honeypot block is recorded and LangSmith tracing is enabled
+- **THEN** the Chainlit state inspector still shows the `honeypot_events` count and recent event summary
+
+#### Scenario: LangSmith disabled does not reduce UI state
+- **WHEN** LangSmith tracing is disabled
+- **THEN** the Chainlit state inspector still displays token, cost, halt, HITL, and honeypot state
