@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Any, Callable
 
 try:
-    from langsmith import traceable
+    from langsmith import Client, traceable
     from langsmith.run_helpers import get_current_run_tree
 except Exception:  # pragma: no cover - import fallback for minimal local envs
+    Client = None
     traceable = None
     get_current_run_tree = None
 
@@ -157,6 +158,167 @@ def _mark_active_trace_incident(
             run = getattr(run, "parent_run", None)
     except Exception as exc:
         print(f"[observability] failed to mark active trace: {exc}")
+
+
+def build_model_step_metrics(
+    step_input_tokens: int,
+    step_output_tokens: int,
+    cumulative_tokens_in: int,
+    cumulative_tokens_out: int,
+    cumulative_cost_eur: float,
+    model_context_window: int,
+) -> dict[str, Any]:
+    """Build the numeric-only metrics payload for one call_model step.
+
+    context_window_pct measures this call's trimmed prompt against the model
+    window, not the cumulative ledger.
+    """
+    context_window_pct = 0.0
+    if model_context_window > 0:
+        context_window_pct = round(
+            step_input_tokens / model_context_window * 100, 2
+        )
+
+    return {
+        "step_input_tokens": step_input_tokens,
+        "step_output_tokens": step_output_tokens,
+        "cumulative_tokens_in": cumulative_tokens_in,
+        "cumulative_tokens_out": cumulative_tokens_out,
+        "cumulative_cost_eur": cumulative_cost_eur,
+        "model_context_window": model_context_window,
+        "context_window_pct": context_window_pct,
+    }
+
+
+# LangSmith dashboards cannot chart metadata on the Y-axis, only feedback
+# scores; these keys are mirrored as feedback so they are chartable.
+CHARTABLE_METRIC_KEYS = (
+    "context_window_pct",
+    "cumulative_cost_eur",
+    "step_input_tokens",
+)
+
+_feedback_client: Any = None
+
+
+def _get_feedback_client() -> Any:
+    global _feedback_client
+    if Client is None:
+        return None
+    if _feedback_client is None:
+        try:
+            _feedback_client = Client()
+        except Exception as exc:
+            print(f"[observability] failed to create LangSmith client: {exc}")
+            _feedback_client = False
+    return _feedback_client or None
+
+
+def _log_step_metric_feedback(run: Any, metrics: dict[str, Any]) -> None:
+    client = _get_feedback_client()
+    if client is None:
+        return
+
+    for key in CHARTABLE_METRIC_KEYS:
+        if key not in metrics:
+            continue
+        try:
+            # Synchronous POST per key; adds a little latency per model step.
+            client.create_feedback(
+                run_id=run.id,
+                key=key,
+                score=metrics[key],
+                trace_id=run.trace_id,
+            )
+        except Exception as exc:
+            print(f"[observability] failed to log feedback {key}: {exc}")
+
+
+# Lowercased substrings that mark a tool result as "no usable data".
+# Sourced from src/tools.py return strings, ToolNode error wrapping, and
+# empty GA4 report payloads.
+DATA_MISS_MARKERS = (
+    "no tables found",
+    "no user-facing tables found",
+    "does not exist",
+    "no results found",
+    '"rows": []',
+)
+
+
+def classify_tool_result_hit(content: Any) -> float:
+    """Score a tool result 1.0 (returned usable data) or 0.0 (miss/error)."""
+    if isinstance(content, (list, tuple)):
+        content = " ".join(str(part) for part in content)
+    text = str(content).strip()
+    if not text:
+        return 0.0
+
+    lowered = text.lower()
+    if lowered.startswith("error") or lowered.startswith("query error"):
+        return 0.0
+    for marker in DATA_MISS_MARKERS:
+        if marker in lowered:
+            return 0.0
+    return 1.0
+
+
+def log_tool_data_hits(messages: list[Any]) -> None:
+    """Log a data_hit feedback score per tool result on the current run.
+
+    The hit-rate analogue of an offload hit rate: did each data-store access
+    (SQLite or GA4) return usable data? Never raises.
+    """
+    if get_current_run_tree is None or not messages:
+        return
+
+    try:
+        run = get_current_run_tree()
+    except Exception as exc:
+        print(f"[observability] failed to get run for data hits: {exc}")
+        return
+    if run is None:
+        return
+
+    client = _get_feedback_client()
+    if client is None:
+        return
+
+    for message in messages:
+        score = classify_tool_result_hit(getattr(message, "content", ""))
+        tool_name = str(getattr(message, "name", "") or "unknown")
+        try:
+            client.create_feedback(
+                run_id=run.id,
+                key="data_hit",
+                score=score,
+                trace_id=run.trace_id,
+                comment=f"tool: {tool_name}",
+            )
+        except Exception as exc:
+            print(f"[observability] failed to log data_hit for {tool_name}: {exc}")
+
+
+def attach_model_step_metrics(metrics: dict[str, Any]) -> None:
+    """Attach step metrics to the current LangSmith run only; never raise.
+
+    Metrics are recorded as run metadata (for trace inspection and filtering)
+    and the chartable subset is mirrored as feedback scores (for dashboards).
+    """
+    if get_current_run_tree is None:
+        return
+
+    try:
+        run = get_current_run_tree()
+        if run is None:
+            return
+        run.add_metadata(metrics)
+        run.patch()
+    except Exception as exc:
+        print(f"[observability] failed to attach step metrics: {exc}")
+        return
+
+    _log_step_metric_feedback(run, metrics)
 
 
 def emit_honeypot_blocked(event: dict[str, Any]) -> dict[str, Any]:

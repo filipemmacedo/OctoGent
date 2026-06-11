@@ -5,6 +5,8 @@ from src.observability import governance_run_metadata, governance_run_tags
 
 DEFAULT_AGENT_MAX_COST_EUR = 0.05
 DEFAULT_AGENT_RECURSION_LIMIT = 12
+# gpt-4o-mini context window; update AGENT_MODEL_CONTEXT_WINDOW when changing models.
+DEFAULT_MODEL_CONTEXT_WINDOW = 128_000
 
 
 def _warn_invalid_env(name: str, value: str, default: object, reason: str) -> None:
@@ -40,6 +42,34 @@ def get_agent_max_cost_eur() -> float:
         return DEFAULT_AGENT_MAX_COST_EUR
 
     return budget
+
+
+def get_model_context_window() -> int:
+    value = os.getenv("AGENT_MODEL_CONTEXT_WINDOW", "").strip()
+    if not value:
+        return DEFAULT_MODEL_CONTEXT_WINDOW
+
+    try:
+        window = int(value)
+    except ValueError:
+        _warn_invalid_env(
+            "AGENT_MODEL_CONTEXT_WINDOW",
+            value,
+            DEFAULT_MODEL_CONTEXT_WINDOW,
+            "expected an integer",
+        )
+        return DEFAULT_MODEL_CONTEXT_WINDOW
+
+    if window <= 0:
+        _warn_invalid_env(
+            "AGENT_MODEL_CONTEXT_WINDOW",
+            value,
+            DEFAULT_MODEL_CONTEXT_WINDOW,
+            "must be greater than 0",
+        )
+        return DEFAULT_MODEL_CONTEXT_WINDOW
+
+    return window
 
 
 def get_agent_recursion_limit() -> int:

@@ -7,16 +7,20 @@ from typing import Any
 from langchain.chat_models import init_chat_model
 from langchain_core.callbacks import get_usage_metadata_callback
 from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import RetryPolicy, interrupt
 
-from src.config import get_agent_max_cost_eur
+from src.config import get_agent_max_cost_eur, get_model_context_window
 from src.honeypot import detect_honeypot_tool_call, honeypot_error_message
 from src.observability import (
+    attach_model_step_metrics,
+    build_model_step_metrics,
     emit_budget_halt,
     emit_hitl_decision,
     emit_honeypot_blocked,
+    log_tool_data_hits,
 )
 from src.state import AgentState
 from src.tool_policy import ToolPolicy, default_unknown_tool_policy
@@ -307,7 +311,20 @@ def build_graph(
             + new_in * PRICE_INPUT_PER_TOKEN
             + new_out * PRICE_OUTPUT_PER_TOKEN
         )
-        print(f"[tokens] +{new_in}in/{new_out}out | session total: EUR {cost_eur:.6f}")
+        metrics = build_model_step_metrics(
+            step_input_tokens=new_in,
+            step_output_tokens=new_out,
+            cumulative_tokens_in=tokens_in,
+            cumulative_tokens_out=tokens_out,
+            cumulative_cost_eur=cost_eur,
+            model_context_window=get_model_context_window(),
+        )
+        attach_model_step_metrics(metrics)
+        print(
+            f"[tokens] +{new_in}in/{new_out}out"
+            f" | ctx {metrics['context_window_pct']}%"
+            f" | session total: EUR {cost_eur:.6f}"
+        )
         return {
             "messages": [response],
             "tokens_in": tokens_in,
@@ -541,9 +558,17 @@ def build_graph(
     graph.add_node("honeypot_guard", honeypot_guard)
     graph.add_node("approval_gate", approval_gate)
     graph.add_node("approval_interrupt", approval_interrupt)
+    tool_node = ToolNode(tools, handle_tool_errors=True)
+
+    async def tools_with_metrics(state: AgentState, config: RunnableConfig) -> Any:
+        result = await tool_node.ainvoke(state, config)
+        if isinstance(result, dict):
+            log_tool_data_hits(result.get("messages", []))
+        return result
+
     graph.add_node(
         "tools",
-        ToolNode(tools, handle_tool_errors=True),
+        tools_with_metrics,
         retry=RetryPolicy(max_attempts=3),
     )
     graph.add_edge(START, "call_model")
