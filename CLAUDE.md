@@ -61,6 +61,23 @@ The current implementation is beyond the original skeleton:
   LangSmith traces may show graph nodes like `honeypot_guard`; that only means
   the guard ran. A real canary incident is indicated by `honeypot_events` and
   explicit `governance_event=honeypot_blocked` trace metadata/tags.
+- Orchestration metrics are implemented: each `call_model` run gets
+  `step_input_tokens`, `step_output_tokens`, `cumulative_tokens_in`,
+  `cumulative_tokens_out`, `cumulative_cost_eur`, `model_context_window`, and
+  `context_window_pct` as LangSmith metadata, with the chartable subset
+  (`context_window_pct`, `cumulative_cost_eur`, `step_input_tokens`) mirrored
+  as feedback scores. Tool results are scored as `data_hit` (1.0/0.0) on the
+  `tools` run, excluding honeypot-blocked calls. `AGENT_MODEL_CONTEXT_WINDOW`
+  configures the context window. `docs/langsmith-metrics.md` documents how to
+  read every metric (including the `context_groundedness` online evaluator)
+  in the LangSmith UI.
+- Human feedback is implemented: Chainlit's built-in 👍/👎 controls (data-layer
+  driven, via `LangSmithFeedbackDataLayer` in `app.py`) mirror ratings to
+  LangSmith as the `user_score` feedback score on the root run that produced
+  the answer. `user_score` is the human answer-quality signal. Each
+  `astream_events` invocation gets a pre-generated `run_id`; the final answer
+  message stores it as `langsmith_run_id` metadata so ratings on resumed
+  threads still resolve after a restart.
 
 Important files:
 
@@ -170,6 +187,12 @@ around it rather than replacing the loop.
 - In Chainlit, human approval should be structured UI state (actions/forms)
   linked to the pending interrupt. Regular chat messages remain user intent for
   the agent, not governance approval.
+- Human answer-quality feedback uses Chainlit's built-in data-layer feedback
+  UI (👍/👎), not custom actions. Ratings are mirrored to LangSmith as
+  `user_score` (1.0/0.0) with a deterministic `uuid5` feedback id keyed on the
+  rated message id, so re-rating updates instead of duplicating and removal
+  deletes. Forwarding is optional and non-blocking: local persistence never
+  depends on LangSmith.
 
 ## Conventions
 
@@ -200,7 +223,3 @@ never the other way around.
 - When a step is implemented and verified, archive the change and update this
   file so context stays current.
 - Keep changes observable: demonstrating control is the goal.
-
-Next OpenSpec change:
-
-`/opsx:archive add-langsmith-governance-observability`
