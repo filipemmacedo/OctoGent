@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import uuid
 from typing import Any, Callable
 
 try:
@@ -36,7 +38,7 @@ def governance_run_metadata(thread_id: str, interface: str) -> dict[str, Any]:
     }
 
 
-def _safe_text(value: Any, limit: int = 240) -> str:
+def safe_text(value: Any, limit: int = 240) -> str:
     text = str(value)
     if len(text) <= limit:
         return text
@@ -75,7 +77,7 @@ def sanitize_governance_event(event: dict[str, Any]) -> dict[str, Any]:
     ):
         if key in event and event[key] is not None:
             value = event[key]
-            safe[key] = _safe_text(value) if isinstance(value, str) else value
+            safe[key] = safe_text(value) if isinstance(value, str) else value
 
     if "args" in event:
         safe["args_summary"] = _args_summary(event["args"])
@@ -297,6 +299,157 @@ def log_tool_data_hits(messages: list[Any]) -> None:
             )
         except Exception as exc:
             print(f"[observability] failed to log data_hit for {tool_name}: {exc}")
+
+
+# Human 👍/👎 ratings from the Chainlit UI, recorded on the root run that
+# produced the rated answer. The feedback id is derived deterministically from
+# the rated message id so re-rating upserts instead of appending.
+USER_FEEDBACK_KEY = "user_score"
+_USER_FEEDBACK_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, f"{APP_NAME}/user_score")
+
+
+def user_feedback_id(message_id: str) -> str:
+    return str(uuid.uuid5(_USER_FEEDBACK_NAMESPACE, str(message_id)))
+
+
+def create_answer_example(
+    user_message: str,
+    assistant_answer: str,
+    thread_id: str,
+    message_id: str,
+    run_id: str,
+) -> str | None:
+    """Create an example in a configured LangSmith dataset; never raise."""
+    dataset_id = os.getenv("LANGSMITH_FEEDBACK_DATASET_ID")
+    dataset_name = os.getenv("LANGSMITH_FEEDBACK_DATASET_NAME")
+    if not dataset_id and not dataset_name:
+        return None
+
+    client = _get_feedback_client()
+    if client is None:
+        return None
+
+    kwargs = {"dataset_id": dataset_id} if dataset_id else {"dataset_name": dataset_name}
+    try:
+        example = client.create_example(
+            **kwargs,
+            inputs={"user_message": user_message},
+            outputs={"assistant_answer": assistant_answer},
+            metadata={
+                "app": APP_NAME,
+                "interface": "chainlit",
+                "thread_id": thread_id,
+                "message_id": message_id,
+                "source_run_id": run_id,
+            },
+        )
+        return str(example.id)
+    except Exception as exc:
+        print(f"[observability] failed to create dataset example: {exc}")
+        return None
+
+
+def log_user_feedback(
+    run_id: str,
+    score: float,
+    comment: str | None,
+    message_id: str,
+    example_id: str | None = None,
+) -> bool:
+    """Record a human rating as user_score feedback on a run; never raise."""
+    client = _get_feedback_client()
+    if client is None:
+        return False
+
+    feedback_id = user_feedback_id(message_id)
+
+    try:
+        client.create_feedback(
+            run_id=run_id,
+            trace_id=run_id,
+            key=USER_FEEDBACK_KEY,
+            score=float(score),
+            comment=comment or None,
+            feedback_id=feedback_id,
+        )
+        if example_id:
+            update_dataset_example_feedback(
+                example_id=example_id,
+                score=score,
+                comment=comment,
+                message_id=message_id,
+                run_id=run_id,
+            )
+        return True
+    except Exception as create_exc:
+        # The feedback id may already exist (re-rating); fall back to update.
+        try:
+            client.update_feedback(
+                feedback_id,
+                score=float(score),
+                comment=comment or None,
+            )
+            if example_id:
+                update_dataset_example_feedback(
+                    example_id=example_id,
+                    score=score,
+                    comment=comment,
+                    message_id=message_id,
+                    run_id=run_id,
+                )
+            return True
+        except Exception as update_exc:
+            print(
+                "[observability] failed to log user feedback: "
+                f"create: {create_exc}; update: {update_exc}"
+            )
+            return False
+
+
+def update_dataset_example_feedback(
+    example_id: str,
+    score: float,
+    comment: str | None,
+    message_id: str,
+    run_id: str,
+) -> bool:
+    client = _get_feedback_client()
+    if client is None:
+        return False
+
+    try:
+        existing = client.read_example(example_id)
+        metadata = getattr(existing, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        client.update_example(
+            example_id=example_id,
+            metadata={
+                **metadata,
+                "user_score": float(score),
+                "user_feedback": comment or None,
+                "message_id": message_id,
+                "source_run_id": run_id,
+            },
+        )
+        return True
+    except Exception as exc:
+        print(f"[observability] failed to update dataset example: {exc}")
+        return False
+
+
+def delete_user_feedback(message_id: str) -> bool:
+    """Delete the user_score feedback derived from a message id; never raise."""
+    client = _get_feedback_client()
+    if client is None:
+        return False
+
+    try:
+        client.delete_feedback(user_feedback_id(message_id))
+        return True
+    except Exception as exc:
+        print(f"[observability] failed to delete user feedback: {exc}")
+        return False
 
 
 def attach_model_step_metrics(metrics: dict[str, Any]) -> None:

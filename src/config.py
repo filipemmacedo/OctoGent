@@ -105,6 +105,7 @@ def build_graph_config(
     interface: str = "unknown",
     extra_metadata: dict | None = None,
     extra_tags: list[str] | None = None,
+    run_id=None,
 ) -> dict:
     recursion_limit = get_agent_recursion_limit()
     metadata = {
@@ -118,9 +119,14 @@ def build_graph_config(
     if extra_tags:
         tags.extend(extra_tags)
 
-    return {
+    config = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": recursion_limit,
         "metadata": metadata,
         "tags": tags,
     }
+    if run_id is not None:
+        # Caller-chosen root run id, so feedback can target the trace without
+        # a LangSmith round trip.
+        config["run_id"] = run_id
+    return config

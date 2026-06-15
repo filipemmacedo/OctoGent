@@ -18,7 +18,7 @@
 ## 4. Online context-groundedness evaluator (LangSmith workspace)
 
 - [x] 4.1 Write the LLM-as-judge prompt for `context_groundedness` (score 0–1 + comment; judge evaluates the response strictly against the run's recorded trimmed input) and version it in the docs file
-- [ ] 4.2 Configure the online evaluator in the LangSmith project: rule on root runs / `call_model` runs, sampling rate (start ~10%), feedback key `context_groundedness`; record every configuration value in the docs so setup is reproducible
+- [x] 4.2 Configure the online evaluator in the LangSmith project: rule on root runs / `call_model` runs, sampling rate (start ~10%), feedback key `context_groundedness`; record every configuration value in the docs so setup is reproducible
 
 ## 5. Operator documentation
 

@@ -2,6 +2,7 @@ import logging
 import json
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 import chainlit as cl
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
@@ -16,6 +17,12 @@ logging.basicConfig(level=logging.INFO)
 
 from src.config import build_graph_config
 from src.mcp_tools import build_mcp_config, describe_mcp_config, load_ga_tools
+from src.observability import (
+    create_answer_example,
+    delete_user_feedback,
+    log_user_feedback,
+    safe_text,
+)
 from src.tools import list_tables, describe_table, query_database
 from src.graph import build_graph, create_checkpointer
 from src.tool_policy import build_tool_policies
@@ -73,6 +80,7 @@ CREATE TABLE IF NOT EXISTS steps (
 CREATE TABLE IF NOT EXISTS feedbacks (
     "id" TEXT PRIMARY KEY,
     "forId" TEXT NOT NULL,
+    "threadId" TEXT,
     "value" INTEGER NOT NULL,
     "comment" TEXT
 );
@@ -98,6 +106,10 @@ CREATE TABLE IF NOT EXISTS elements (
 """
 
 
+def _is_hitl_status_output(output: Any) -> bool:
+    return str(output or "").startswith("**Selected:**")
+
+
 def _exception_tree_lines(exc: BaseException, indent: int = 0) -> list[str]:
     prefix = "  " * indent
     lines = [f"{prefix}{type(exc).__name__}: {exc}"]
@@ -116,9 +128,203 @@ def _exception_tree_lines(exc: BaseException, indent: int = 0) -> list[str]:
     return lines
 
 
+# Fast-path map from answer message id to the LangSmith root run that produced
+# it; the durable copy lives in the message's steps-table metadata.
+ANSWER_RUN_IDS: dict[str, str] = {}
+ANSWER_EXAMPLE_IDS: dict[str, str] = {}
+
+
+class LangSmithFeedbackDataLayer(SQLAlchemyDataLayer):
+    """Data layer that mirrors human 👍/👎 ratings to LangSmith as user_score.
+
+    Local persistence always runs first and never depends on LangSmith;
+    forwarding failures are printed and swallowed.
+    """
+
+    async def _resolve_run_id(self, message_id: str) -> Optional[str]:
+        run_id = ANSWER_RUN_IDS.get(message_id)
+        if run_id:
+            return run_id
+
+        try:
+            rows = await self.execute_sql(
+                query=(
+                    'SELECT "metadata", "output", "threadId", "createdAt" '
+                    'FROM steps WHERE "id" = :id'
+                ),
+                parameters={"id": message_id},
+            )
+        except Exception as exc:
+            print(f"[feedback] failed to read step metadata: {exc}")
+            return None
+
+        if not isinstance(rows, list) or not rows:
+            # Chainlit wraps every on_message call in an auto-created
+            # Step(name="on_message", type="run", parent_id=<user message>),
+            # which is never persisted to `steps`. The feedback UI attaches
+            # to that run step, so `forId` is its id - the *parent* of our
+            # persisted answer message - rather than the answer's own id.
+            return await self._resolve_run_id_from_child_answer(message_id)
+
+        raw = rows[0].get("metadata")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return None
+        if not isinstance(raw, dict):
+            return None
+        run_id = raw.get("langsmith_run_id")
+        if run_id:
+            return str(run_id)
+
+        return await self._resolve_run_id_from_related_answer(message_id, rows[0])
+
+    async def _resolve_run_id_from_child_answer(self, parent_id: str) -> Optional[str]:
+        """Resolve feedback on Chainlit's auto on_message run step.
+
+        That step id (the rated bubble's `forId`) is the parent of the final
+        answer message, which carries the `langsmith_run_id` metadata.
+        """
+        try:
+            rows = await self.execute_sql(
+                query="""
+                    SELECT "metadata"
+                    FROM steps
+                    WHERE "parentId" = :parent_id
+                      AND "type" = 'assistant_message'
+                    ORDER BY "createdAt" DESC
+                    LIMIT 1
+                """,
+                parameters={"parent_id": parent_id},
+            )
+        except Exception as exc:
+            print(f"[feedback] failed to resolve child answer metadata: {exc}")
+            return None
+
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        raw = rows[0].get("metadata")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return None
+        if not isinstance(raw, dict):
+            return None
+
+        run_id = raw.get("langsmith_run_id")
+        return str(run_id) if run_id else None
+
+    async def _resolve_run_id_from_related_answer(
+        self,
+        message_id: str,
+        rated_step: dict,
+    ) -> Optional[str]:
+        """Resolve feedback on Chainlit approval/status messages to the answer.
+
+        Chainlit renders feedback controls on assistant/status messages too.
+        The HITL action message is persisted as ``**Selected:** Approve`` and
+        has no LangSmith run metadata of its own, so map it to the next final
+        answer in the same thread when possible.
+        """
+        if not _is_hitl_status_output(rated_step.get("output")):
+            return None
+
+        thread_id = rated_step.get("threadId")
+        created_at = rated_step.get("createdAt")
+        if not thread_id or not created_at:
+            return None
+
+        try:
+            rows = await self.execute_sql(
+                query="""
+                    SELECT "id", "metadata"
+                    FROM steps
+                    WHERE "threadId" = :thread_id
+                      AND "id" != :id
+                      AND "type" = 'assistant_message'
+                      AND "createdAt" >= :created_at
+                    ORDER BY "createdAt" ASC
+                    LIMIT 20
+                """,
+                parameters={
+                    "thread_id": thread_id,
+                    "id": message_id,
+                    "created_at": created_at,
+                },
+            )
+        except Exception as exc:
+            print(f"[feedback] failed to resolve related answer metadata: {exc}")
+            return None
+
+        if not isinstance(rows, list):
+            return None
+
+        for row in rows:
+            raw = row.get("metadata")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except ValueError:
+                    continue
+            if not isinstance(raw, dict):
+                continue
+            run_id = raw.get("langsmith_run_id")
+            if run_id:
+                print(
+                    f"[feedback] mapped status message {message_id} "
+                    f"to answer {row.get('id')}"
+                )
+                return str(run_id)
+
+        return None
+
+    async def upsert_feedback(self, feedback) -> str:
+        feedback_id = await super().upsert_feedback(feedback)
+
+        run_id = await self._resolve_run_id(feedback.forId)
+        if run_id is None:
+            print(
+                f"[feedback] no langsmith_run_id for message {feedback.forId}; "
+                "rating kept local-only"
+            )
+            return feedback_id
+
+        example_id = ANSWER_EXAMPLE_IDS.get(feedback.forId)
+        score = 1.0 if feedback.value else 0.0
+        if log_user_feedback(
+            run_id=run_id,
+            score=score,
+            comment=feedback.comment,
+            message_id=feedback.forId,
+            example_id=example_id,
+        ):
+            print(f"[feedback] user_score={score} recorded on run {run_id}")
+        return feedback_id
+
+    async def delete_feedback(self, feedback_id: str) -> bool:
+        for_id: Optional[str] = None
+        try:
+            rows = await self.execute_sql(
+                query='SELECT "forId" FROM feedbacks WHERE "id" = :id',
+                parameters={"id": feedback_id},
+            )
+            if isinstance(rows, list) and rows:
+                for_id = rows[0].get("forId")
+        except Exception as exc:
+            print(f"[feedback] failed to read feedback row: {exc}")
+
+        deleted = await super().delete_feedback(feedback_id)
+        if for_id and delete_user_feedback(for_id):
+            print(f"[feedback] user_score removed for message {for_id}")
+        return deleted
+
+
 @cl.data_layer
 def get_data_layer():
-    return SQLAlchemyDataLayer(conninfo=_DB_URI)
+    return LangSmithFeedbackDataLayer(conninfo=_DB_URI)
 
 
 @cl.on_app_startup
@@ -134,6 +340,11 @@ async def on_app_startup():
             stmt = statement.strip()
             if stmt:
                 await conn.execute(stmt)
+        feedback_columns = await conn.execute('PRAGMA table_info("feedbacks")')
+        added_thread_id_column = False
+        if "threadId" not in {row[1] for row in await feedback_columns.fetchall()}:
+            await conn.execute('ALTER TABLE feedbacks ADD COLUMN "threadId" TEXT')
+            added_thread_id_column = True
         cursor = await conn.execute(
             """
             UPDATE steps
@@ -143,9 +354,52 @@ async def on_app_startup():
             """
         )
         repaired = max(cursor.rowcount, 0)
+        cursor = await conn.execute(
+            """
+            DELETE FROM steps
+            WHERE "output" LIKE '**Selected:%'
+            """
+        )
+        removed_hitl_status = max(cursor.rowcount, 0)
+        cursor = await conn.execute(
+            """
+            DELETE FROM steps
+            WHERE "type" = 'tool'
+            """
+        )
+        removed_tool_steps = max(cursor.rowcount, 0)
+        cursor = await conn.execute(
+            """
+            UPDATE steps
+            SET "type" = 'system_message'
+            WHERE "type" = 'assistant_message'
+              AND (
+                "name" = 'system'
+                OR "output" LIKE '**State Inspector**%'
+                OR "output" LIKE '**MCP Status**%'
+                OR "output" LIKE '💰%'
+                OR "output" LIKE 'Execution stopped:%'
+              )
+            """
+        )
+        reclassified_system_messages = max(cursor.rowcount, 0)
         await conn.commit()
+    if added_thread_id_column:
+        print('[startup] Added missing "threadId" column to feedbacks table')
     if repaired:
         print(f"[startup] Repaired {repaired} orphan Chainlit step parent(s)")
+    if removed_hitl_status:
+        print(
+            "[startup] Removed "
+            f"{removed_hitl_status} persisted HITL status message(s)"
+        )
+    if removed_tool_steps:
+        print(f"[startup] Removed {removed_tool_steps} persisted tool step(s)")
+    if reclassified_system_messages:
+        print(
+            "[startup] Reclassified "
+            f"{reclassified_system_messages} non-answer message(s) as system messages"
+        )
     print("[startup] Chainlit DB tables ready")
 
     MCP_STATUS_CACHE = await _load_mcp_tools_once()
@@ -281,8 +535,11 @@ async def _send_message(
     **kwargs,
 ) -> cl.Message:
     """Send a Chainlit message with an explicit persisted parent."""
+    if kwargs.get("author") == "system" and "type" not in kwargs:
+        kwargs["type"] = "system_message"
     msg = cl.Message(content=content, **kwargs)
-    msg.parent_id = parent_id
+    if parent_id is not None:
+        msg.parent_id = parent_id
     await msg.send()
     return msg
 
@@ -490,7 +747,7 @@ async def _ask_for_json_args(payload: dict) -> Optional[dict]:
 
 
 async def _ask_chainlit_approval(payload: dict) -> dict:
-    response = await cl.AskActionMessage(
+    approval_message = cl.AskActionMessage(
         content=_format_tool_approval_request(payload),
         actions=[
             cl.Action(
@@ -511,7 +768,13 @@ async def _ask_chainlit_approval(payload: dict) -> dict:
         ],
         timeout=300,
         raise_on_timeout=False,
-    ).send()
+    )
+    # Chainlit otherwise persists the post-action ``**Selected:** ...`` row as
+    # an assistant message, which makes the built-in thumbs feedback target the
+    # approval status instead of the final answer.
+    approval_message.type = "system_message"
+    response = await approval_message.send()
+    await approval_message.remove()
 
     action = _action_name(response)
     if action == "hitl_approve":
@@ -563,6 +826,21 @@ async def on_message(message: cl.Message):
         await _send_message(content=f"⚠️ Error: {exc}", parent_id=message.id)
 
 
+def _new_invocation_config(thread_id: str, user_message: Optional[str] = None):
+    """Return (run_id, config) for one graph invocation with a fresh root run."""
+    run_id = uuid4()
+    extra_metadata = None
+    if user_message:
+        extra_metadata = {"user_message": safe_text(user_message)}
+    config = build_graph_config(
+        thread_id,
+        interface="chainlit",
+        extra_metadata=extra_metadata,
+        run_id=run_id,
+    )
+    return run_id, config
+
+
 async def _handle_message(message: cl.Message):
     graph = cl.user_session.get("graph")
     thread_id = cl.user_session.get("thread_id")
@@ -574,15 +852,15 @@ async def _handle_message(message: cl.Message):
         )
         return
 
-    config = build_graph_config(thread_id, interface="chainlit")
-
     tokens_in_before = cl.user_session.get("tokens_in", 0)
     tokens_out_before = cl.user_session.get("tokens_out", 0)
     cost_eur_before = cl.user_session.get("cost_eur", 0.0)
     msgs_before = cl.user_session.get("msg_count", 0)
 
     final_state: dict = {}
-    tool_steps: dict[str, cl.Step] = {}
+    # Each astream_events call is its own LangSmith root run, including HITL
+    # resumes; the last one produced the final answer, so feedback targets it.
+    last_run_id, config = _new_invocation_config(thread_id, message.content)
 
     try:
         graph_input: Any = {
@@ -602,20 +880,6 @@ async def _handle_message(message: cl.Message):
                         _interrupt_payload_from_event(event) or interrupt_payload
                     )
 
-                elif kind == "on_tool_start":
-                    tool_name = event["name"]
-                    step = cl.Step(name=tool_name, type="tool")
-                    await step.__aenter__()
-                    tool_steps[event["run_id"]] = step
-
-                elif kind == "on_tool_end":
-                    run_id = event["run_id"]
-                    if run_id in tool_steps:
-                        step = tool_steps.pop(run_id)
-                        output = event["data"].get("output", "")
-                        step.output = str(output)[:800]
-                        await step.__aexit__(None, None, None)
-
                 elif kind == "on_chain_end" and event.get("name") == "LangGraph":
                     final_state = event["data"].get("output", {})
 
@@ -624,12 +888,10 @@ async def _handle_message(message: cl.Message):
 
             decision = await _ask_chainlit_approval(interrupt_payload)
             graph_input = Command(resume=decision)
+            last_run_id, config = _new_invocation_config(thread_id, message.content)
     except GraphRecursionError as exc:
         halt_reason = f"Loop limit exceeded: {exc}"
         print(f"[recursion] halted: {halt_reason}")
-        for step in tool_steps.values():
-            await step.__aexit__(None, None, None)
-        tool_steps.clear()
         try:
             state = await graph.aget_state(config)
             if state and state.values:
@@ -669,9 +931,6 @@ async def _handle_message(message: cl.Message):
         last = messages[-1]
         final_content = last.content if hasattr(last, "content") else str(last)
 
-    if final_content:
-        await _send_message(content=final_content, parent_id=message.id)
-
     if halted and halt_reason:
         await _send_message(
             content=f"Execution stopped: {halt_reason}",
@@ -694,6 +953,7 @@ async def _handle_message(message: cl.Message):
             await _send_message(
                 content=f"**State Inspector**\n\n{inspector_text}",
                 parent_id=message.id,
+                author="system",
             )
         except Exception as e:
             print(f"[inspector error] {e}")
@@ -703,6 +963,28 @@ async def _handle_message(message: cl.Message):
         parent_id=message.id,
         author="system",
     )
+
+    if final_content:
+        answer_msg = await _send_message(
+            content=final_content,
+            metadata={"langsmith_run_id": str(last_run_id)},
+        )
+        ANSWER_RUN_IDS[answer_msg.id] = str(last_run_id)
+        example_id = create_answer_example(
+            user_message=message.content,
+            assistant_answer=final_content,
+            thread_id=thread_id,
+            message_id=answer_msg.id,
+            run_id=str(last_run_id),
+        )
+        if example_id:
+            ANSWER_EXAMPLE_IDS[answer_msg.id] = example_id
+        if answer_msg.parent_id:
+            # Chainlit's feedback UI attaches to the auto on_message run step
+            # (this message's parent), so cache that id too.
+            ANSWER_RUN_IDS[answer_msg.parent_id] = str(last_run_id)
+            if example_id:
+                ANSWER_EXAMPLE_IDS[answer_msg.parent_id] = example_id
 
 
 @cl.on_stop
