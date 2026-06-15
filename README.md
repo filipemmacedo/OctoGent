@@ -1,3 +1,5 @@
+![alt text](image.png)
+
 # Governed LangGraph Agent with Local GA4 MCP
 
 This project is a LangGraph + OpenAI reference implementation for governed tool-calling agents. It can use local SQLite tools and, when configured, a separate local Google Analytics 4 MCP server.
